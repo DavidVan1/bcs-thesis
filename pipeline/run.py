@@ -12,7 +12,7 @@ Examples:
     python -m pipeline.run sf orthorectify
     python -m pipeline.run sf verify
 
-Available matchers: lightglue, xoftr, loftr, roma, mast3r, dust3r
+Available matchers: lightglue, aliked, xoftr, loftr, roma, mast3r, dust3r
 """
 
 import argparse

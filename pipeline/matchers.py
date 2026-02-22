@@ -10,6 +10,7 @@ conversion, tensor format) and rescales output keypoints back to the
 Supported matchers
 ------------------
 * ``lightglue``   – SuperPoint + LightGlue  (sparse)
+* ``aliked``      – ALIKED + LightGlue      (sparse)
 * ``xoftr``       – XoFTR                    (dense)
 * ``loftr``       – MiniMA-LoFTR             (dense)
 * ``roma``        – MiniMA-RoMa              (dense)
@@ -146,6 +147,38 @@ class LightGlueMatcher(BaseMatcher):
         print(f"  LightGlue on {device}")
         self.extractor = SuperPoint(max_num_keypoints=max_keypoints).eval().to(device)
         self.matcher = LightGlue(features="superpoint").eval().to(device)
+
+    def match(self, img0, img1):
+        t0 = _to_grayscale_tensor(img0, self.device)
+        t1 = _to_grayscale_tensor(img1, self.device)
+        with torch.no_grad():
+            f0 = self.extractor.extract(t0)
+            f1 = self.extractor.extract(t1)
+            m = self.matcher({"image0": f0, "image1": f1})
+        matches = m["matches"][0]
+        if len(matches) == 0:
+            return _empty()
+        kp0 = f0["keypoints"][0][matches[:, 0]].cpu().numpy()
+        kp1 = f1["keypoints"][0][matches[:, 1]].cpu().numpy()
+        conf = m["scores"][0].cpu().numpy()
+        return {"keypoints0": kp0, "keypoints1": kp1, "confidence": conf}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ALIKED + LightGlue  (sparse: ALIKED + LightGlue)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ALIKEDLightGlueMatcher(BaseMatcher):
+    """ALIKED keypoints + LightGlue matcher (grayscale, sparse)."""
+    name = "aliked"
+
+    def __init__(self, device: str = "cuda", max_keypoints: int = 2048):
+        super().__init__(device, max_keypoints)
+        _ensure_path(_TP / "LightGlue")
+        from lightglue import LightGlue, ALIKED  # noqa
+        print(f"  ALIKED + LightGlue on {device}")
+        self.extractor = ALIKED(max_num_keypoints=max_keypoints).eval().to(device)
+        self.matcher = LightGlue(features="aliked").eval().to(device)
 
     def match(self, img0, img1):
         t0 = _to_grayscale_tensor(img0, self.device)
@@ -382,6 +415,7 @@ class DUSt3RMatcher(BaseMatcher):
 
 _REGISTRY: dict[str, type[BaseMatcher]] = {
     "lightglue": LightGlueMatcher,
+    "aliked":    ALIKEDLightGlueMatcher,
     "xoftr":     XoFTRMatcher,
     "loftr":     LoFTRMatcher,
     "roma":      RoMAMatcher,
@@ -404,7 +438,7 @@ def get_matcher(name: str, *,
     Parameters
     ----------
     name : str
-        One of: lightglue, xoftr, loftr, roma, mast3r, dust3r.
+        One of: lightglue, aliked, xoftr, loftr, roma, mast3r, dust3r.
     device : str
         ``"cpu"`` or ``"cuda"``.
     max_keypoints : int
