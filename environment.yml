@@ -18,6 +18,10 @@ dependencies:
   - conda-forge::rasterio>=1.3
   - conda-forge::pyproj>=3.5
   - conda-forge::shapely>=2.0
+  - conda-forge::libgdal-jp2openjpeg
+
+  # ML/HuggingFace
+  - conda-forge::huggingface_hub
 
   # Scientific
   - conda-forge::numpy>=1.24
@@ -33,6 +37,13 @@ dependencies:
     - tqdm>=4.65
     - scikit-learn>=1.3
     - affine>=2.4
+    - yacs
+    # Third-party matcher dependencies
+    - -r third_party/LightGlue/requirements.txt
+    - -r third_party/RoMa/requirements.txt
+    - -r third_party/XoFTR/requirements.txt
+    - -r third_party/dust3r/requirements.txt
+    - -r third_party/mast3r/requirements.txt
 
 # Create:  conda env create -f environment.yml
 # Update:  conda env update -f environment.yml --prune
