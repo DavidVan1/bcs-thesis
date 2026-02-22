@@ -76,12 +76,13 @@ def reproject_sentinel_to_phisat(
 # ── RANSAC filter ──────────────────────────────────────────────────────
 
 def ransac_filter(kp0: np.ndarray, kp1: np.ndarray,
-                  threshold: float = 5.0
+                  threshold: float = 8.0
                   ) -> Tuple[np.ndarray, np.ndarray]:
     """Filter matches with RANSAC homography.  Returns inlier arrays."""
     if len(kp0) < 4:
         return kp0, kp1
-    H, mask = cv2.findHomography(kp0, kp1, cv2.RANSAC, threshold)
+    H, mask = cv2.findHomography(kp0, kp1, cv2.RANSAC, threshold,
+                                 confidence=0.99999)
     if mask is not None:
         m = mask.ravel().astype(bool)
         return kp0[m], kp1[m]
