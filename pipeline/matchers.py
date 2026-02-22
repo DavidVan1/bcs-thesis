@@ -139,7 +139,7 @@ class BaseMatcher(ABC):
 class LightGlueMatcher(BaseMatcher):
     name = "lightglue"
 
-    def __init__(self, device: str = "cpu", max_keypoints: int = 2048):
+    def __init__(self, device: str = "cuda", max_keypoints: int = 2048):
         super().__init__(device, max_keypoints)
         _ensure_path(_TP / "LightGlue")
         from lightglue import LightGlue, SuperPoint  # noqa
