@@ -7,11 +7,12 @@ import torch
 from .. import DEVICE, MODEL_REPO_ID, logger
 
 tp_path = Path(__file__).parent / "../.."
-sys.path.append(str(tp_path))
+xoftr_path = tp_path / "XoFTR"
+sys.path.insert(0, str(xoftr_path))
 
-from XoFTR.src.config.default import get_cfg_defaults
-from XoFTR.src.utils.misc import lower_config
-from XoFTR.src.xoftr import XoFTR as XoFTR_
+from src.config.default import get_cfg_defaults
+from src.utils.misc import lower_config
+from src.xoftr import XoFTR as XoFTR_
 
 
 from ..utils.base_model import BaseModel
