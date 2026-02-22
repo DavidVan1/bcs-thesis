@@ -1,0 +1,40 @@
+name: phisat
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+
+  # PyTorch with CUDA 12.1 (change cu121 → cu118 if your server has CUDA 11.8)
+  - pytorch::pytorch>=2.0
+  - pytorch::torchvision>=0.15
+  - pytorch::pytorch-cuda=12.1
+
+  # Geospatial stack (conda builds link against system GDAL/PROJ correctly)
+  - conda-forge::rasterio>=1.3
+  - conda-forge::pyproj>=3.5
+  - conda-forge::shapely>=2.0
+
+  # Scientific
+  - conda-forge::numpy>=1.24
+  - conda-forge::scipy>=1.10
+
+  # pip-only packages
+  - pip
+  - pip:
+    - kornia>=0.7
+    - opencv-python>=4.7
+    - Pillow>=10.0
+    - matplotlib>=3.7
+    - tqdm>=4.65
+    - scikit-learn>=1.3
+    - affine>=2.4
+
+# Create:  conda env create -f environment.yml
+# Update:  conda env update -f environment.yml --prune
+# Activate: conda activate phisat
+# Run:     python -m pipeline.run sf
