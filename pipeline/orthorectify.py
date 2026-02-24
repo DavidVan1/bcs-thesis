@@ -32,7 +32,7 @@ except ImportError:
     from scipy.ndimage import map_coordinates
 
 from .config import SceneConfig
-from .sensor_model import PhiSatPushbroomModel, R_EARTH, create_model
+from .sensor_model import PhiSatPushbroomModel, create_model
 from .utils import load_calibration
 
 
@@ -73,7 +73,12 @@ class OrthorectificationEngine:
     def _apply_calibration(self):
         p = self.calib_params
         self.model.f = p.get("f", self.model.f)
+        self.model.cx = p.get("cx", self.model.cx)
+        self.model.cy = p.get("cy", self.model.cy)
+        self.model.k1 = p.get("k1", 0.0)
+        self.model.k2 = p.get("k2", 0.0)
         self.calib_time_shift = p.get("time_shift", 0.0)
+        self.calib_along_scale = p.get("along_scale", 1.0)
 
         self.mounting_bias = {
             "roll": p.get("roll", 0.0),
@@ -90,9 +95,11 @@ class OrthorectificationEngine:
             self.model.quaternion)
 
         print(f"Calibration: f={self.model.f:.1f}  "
+              f"cx={self.model.cx:.2f}  cy={self.model.cy:.2f}  "
               f"R={self.mounting_bias['roll']:.3f}°  "
               f"P={self.mounting_bias['pitch']:.3f}°  "
-              f"Y={self.mounting_bias['yaw']:.3f}°")
+              f"Y={self.mounting_bias['yaw']:.3f}°  "
+              f"along_scale={self.calib_along_scale:.6f}")
 
     # ── DEM query ───────────────────────────────────────────────────
 
@@ -116,7 +123,13 @@ class OrthorectificationEngine:
     # ── forward projection with bias ────────────────────────────────
 
     def _forward_biased(self, u: float, v: float) -> Optional[np.ndarray]:
-        """Forward-project pixel (u, v) → ECEF using calibrated model."""
+        """Forward-project pixel (u, v) → ECEF using calibrated model.
+
+        Uses iterative DEM-aware ray–ellipsoid intersection so that
+        the Newton back-projection converges to the correct ground point
+        at terrain height (not sea level).
+        """
+        from .sensor_model import _intersect_ellipsoid, _ecef_to_geodetic
         x_norm = (u - self.model.cx) / self.model.f
         r2 = x_norm ** 2
         dist = 1.0 + self.model.k1 * r2 + self.model.k2 * r2 ** 2
@@ -125,32 +138,69 @@ class OrthorectificationEngine:
 
         ray_body = self._rot_bias.apply(ray_cam)
 
-        t = self.model.scanline_to_time(v) + self.calib_time_shift
+        # Along-track timing with calibrated scale
+        dt = ((v - self.model.cy) * self.model.line_time
+              * self.calib_along_scale + self.model.along_shift)
+        t = self.model.t0 + dt + self.calib_time_shift
         sat_pos = self.model.position + self.model.velocity * (t - self.model.t0)
 
         R_o2e = self.model.get_orbital_rotation_matrix(
             sat_pos, self.model.velocity)
         ray_world = R_o2e @ self._R_b2o @ ray_body
 
-        a = np.dot(ray_world, ray_world)
-        b = 2.0 * np.dot(sat_pos, ray_world)
-        c = np.dot(sat_pos, sat_pos) - R_EARTH ** 2
-        disc = b * b - 4 * a * c
-        if disc < 0:
-            return None
-        u_param = (-b - np.sqrt(disc)) / (2 * a)
-        if u_param <= 0:
-            u_param = (-b + np.sqrt(disc)) / (2 * a)
-        return sat_pos + u_param * ray_world
+        # Iterative DEM-aware intersection (same as _forward_lonlat)
+        h = 0.0
+        for _ in range(5):
+            pt = _intersect_ellipsoid(sat_pos, ray_world, h=h)
+            if pt is None:
+                return None
+            lon, lat, _ = _ecef_to_geodetic(*pt)
+            h_new = self.dem_query(lon, lat)
+            if h_new is None:
+                break
+            if abs(h_new - h) < 0.5:
+                h = h_new
+                break
+            h = h_new
+        return _intersect_ellipsoid(sat_pos, ray_world, h=h)
 
     def _forward_lonlat(self, u: float, v: float) -> Optional[Tuple[float, float]]:
-        """Forward pixel → (lon, lat)."""
-        ecef = self._forward_biased(u, v)
-        if ecef is None:
+        """Forward pixel → (lon, lat) with iterative DEM refinement."""
+        from .sensor_model import _intersect_ellipsoid, _ecef_to_geodetic
+        x_norm = (u - self.model.cx) / self.model.f
+        r2 = x_norm ** 2
+        dist = 1.0 + self.model.k1 * r2 + self.model.k2 * r2 ** 2
+        ray_cam = np.array([0.0, x_norm * dist, 1.0])
+        ray_cam /= np.linalg.norm(ray_cam)
+        ray_body = self._rot_bias.apply(ray_cam)
+
+        dt = ((v - self.model.cy) * self.model.line_time
+              * self.calib_along_scale + self.model.along_shift)
+        t = self.model.t0 + dt + self.calib_time_shift
+        sat_pos = self.model.position + self.model.velocity * (t - self.model.t0)
+
+        R_o2e = self.model.get_orbital_rotation_matrix(
+            sat_pos, self.model.velocity)
+        ray_world = R_o2e @ self._R_b2o @ ray_body
+
+        # Iterative DEM-aware intersection
+        h = 0.0
+        for _ in range(5):
+            pt = _intersect_ellipsoid(sat_pos, ray_world, h=h)
+            if pt is None:
+                return None
+            lon, lat, _ = _ecef_to_geodetic(*pt)
+            h_new = self.dem_query(lon, lat)
+            if h_new is None:
+                break
+            if abs(h_new - h) < 0.5:
+                h = h_new
+                break
+            h = h_new
+        pt = _intersect_ellipsoid(sat_pos, ray_world, h=h)
+        if pt is None:
             return None
-        x, y, z = ecef
-        lon = np.degrees(np.arctan2(y, x))
-        lat = np.degrees(np.arctan2(z, np.sqrt(x*x + y*y)))
+        lon, lat, _ = _ecef_to_geodetic(*pt)
         return lon, lat
 
     # ── back-projection (Newton) ────────────────────────────────────
@@ -159,18 +209,12 @@ class OrthorectificationEngine:
                         v_hint: Optional[float] = None
                         ) -> Optional[Tuple[float, float]]:
         """Back-project (lon, lat) → image pixel (u, v)."""
+        from .sensor_model import _geodetic_to_ecef
         height = self.dem_query(lon, lat)
         if height is None:
             return None
 
-        lon_r, lat_r = np.radians(lon), np.radians(lat)
-        cos_lat = np.cos(lat_r)
-        r = R_EARTH + height
-        ground = np.array([
-            r * cos_lat * np.cos(lon_r),
-            r * cos_lat * np.sin(lon_r),
-            r * np.sin(lat_r),
-        ])
+        ground = _geodetic_to_ecef(lon, lat, height)
 
         return self._newton(ground, v_hint)
 

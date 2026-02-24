@@ -76,6 +76,7 @@ def load_calibration(json_path: str) -> Dict:
         "pitch": pose.get("pitch", 0.0),
         "yaw": pose.get("yaw", 0.0),
         "time_shift": pose.get("time_shift", 0.0),
+        "along_scale": pose.get("along_scale", 1.0),
     }
 
 
@@ -98,6 +99,7 @@ def save_calibration(calib: Dict, json_path: str,
             "roll": calib.get("roll", 0.0),
             "pitch": calib.get("pitch", 0.0),
             "yaw": calib.get("yaw", 0.0),
+            "along_scale": calib.get("along_scale", 1.0),
         },
     }
     if stats:

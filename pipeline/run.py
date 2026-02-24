@@ -11,6 +11,7 @@ Examples:
     python -m pipeline.run la calibrate
     python -m pipeline.run sf orthorectify
     python -m pipeline.run sf verify
+    python -m pipeline.run sf refine
 
 Available matchers: lightglue, aliked, xoftr, loftr, roma, mast3r, dust3r
 """
@@ -23,7 +24,7 @@ from .config import get_scene_config, list_scenes, SceneConfig
 from .matchers import list_matchers
 
 
-STAGES = ["all", "match", "calibrate", "orthorectify", "verify"]
+STAGES = ["all", "match", "calibrate", "orthorectify", "verify", "refine"]
 
 
 def run_match(config: SceneConfig, matcher_name: str) -> None:
@@ -50,6 +51,12 @@ def run_verify(config: SceneConfig) -> None:
     run_verification(config)
 
 
+def run_refine_stage(config: SceneConfig) -> None:
+    """Run GCP-based affine refinement (shift correction)."""
+    from .refine import run_refine
+    run_refine(config)
+
+
 def run_all(config: SceneConfig, matcher_name: str) -> None:
     """Run the complete pipeline: match → calibrate → orthorectify → verify."""
     print("\n" + "=" * 70)
@@ -60,6 +67,7 @@ def run_all(config: SceneConfig, matcher_name: str) -> None:
     run_calibrate(config)
     run_orthorectify_stage(config)
     run_verify(config)
+    # run_refine_stage(config)
 
     print("\n" + "=" * 70)
     print("  PIPELINE COMPLETE")
@@ -139,6 +147,8 @@ def main():
         run_orthorectify_stage(config)
     elif stage == "verify":
         run_verify(config)
+    # elif stage == "refine":
+    #     run_refine_stage(config)
     else:
         print(f"Unknown stage: {stage}", file=sys.stderr)
         sys.exit(1)
