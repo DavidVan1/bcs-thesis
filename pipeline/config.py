@@ -186,20 +186,65 @@ class SceneConfig:
 # ═══════════════════════════════════════════════════════════════════════════
 
 SCENES = {
+    # "sf": SceneConfig(
+    #     name="sf",
+    #     phisat_dir="phisat/phisat_sf",
+    #     phisat_image="bands/Bp_0_0_4096_4096_0_0_4096_4096_12_RGB.tiff",
+    #     metadata_json="session_3817_metadata.json",
+    #     sentinel_dir="sentinel/sentinel_sf",
+    #     tie_points_csv="outputs/sf/tie_points.csv",
+    #     dem_file="DEM/sf3.tif",
+    #     calib_json="outputs/sf/calibration.json",
+    #     gcp_json="gcp/sf/N37W123.json",
+    #     gcp_chip_dir="gcp/sf/L1C_chips",
+    #     ortho_tif="outputs/sf/ortho.tif",
+    #     initial_f=105790.0,
+    # ),
+
     "sf": SceneConfig(
         name="sf",
         phisat_dir="phisat/phisat_sf",
         phisat_image="bands/Bp_0_0_4096_4096_0_0_4096_4096_12_RGB.tiff",
         metadata_json="session_3817_metadata.json",
         sentinel_dir="sentinel/sentinel_sf",
-        tie_points_csv="outputs/sf/tie_points.csv",
-        dem_file="DEM/sf3.tif",
-        calib_json="outputs/sf/calibration.json",
+        dem_file="DEM/sf.tif",
         gcp_json="gcp/sf/N37W123.json",
         gcp_chip_dir="gcp/sf/L1C_chips",
+        tie_points_csv="outputs/sf/tie_points.csv",
+        calib_json="outputs/sf/calibration.json",
         ortho_tif="outputs/sf/ortho.tif",
         initial_f=105790.0,
     ),
+
+    # "la": SceneConfig(
+    #     name="la",
+    #     phisat_dir="phisat/phisat_la",
+    #     phisat_image="bands/Bp_0_0_4096_4096_0_0_4096_4096_12_RGB.tiff",
+    #     metadata_json="session_2532_metadata.json",
+    #     sentinel_dir="sentinel/sentinel_la",
+    #     tie_points_csv="outputs/la/tie_points.csv",
+    #     dem_file="DEM/la3.tif",
+    #     calib_json="outputs/la/calibration.json",
+    #     gcp_json="gcp/la/N33W119.json",
+    #     gcp_chip_dir="gcp/la/L1C_chips",
+    #     ortho_tif="outputs/la/ortho.tif",
+    #     initial_f=105790.0,
+    # ),
+
+    # "la": SceneConfig(
+    #     name="la",
+    #     phisat_dir="phisat/phisat_la",
+    #     phisat_image="bands/Bp_0_0_4096_4096_0_0_4096_4096_12_RGB.tiff",
+    #     metadata_json="session_2532_metadata.json",
+    #     sentinel_dir="sentinel/sentinel_la",
+    #     dem_file="DEM/la.tif",
+    #     gcp_json="gcp/la/N33W119.json",
+    #     gcp_chip_dir="gcp/la/L1C_chips",
+    #     tie_points_csv="outputs/la/tie_points.csv",
+    #     calib_json="outputs/la/calibration.json",
+    #     ortho_tif="outputs/la/ortho.tif",
+    #     initial_f=105790.0,
+    # ),
 
     "la": SceneConfig(
         name="la",
@@ -207,21 +252,93 @@ SCENES = {
         phisat_image="bands/Bp_0_0_4096_4096_0_0_4096_4096_12_RGB.tiff",
         metadata_json="session_2532_metadata.json",
         sentinel_dir="sentinel/sentinel_la",
-        tie_points_csv="outputs/la/tie_points.csv",
-        dem_file="DEM/la3.tif",
-        calib_json="outputs/la/calibration.json",
+        dem_file="DEM/la.tif",
         gcp_json="gcp/la/N33W119.json",
         gcp_chip_dir="gcp/la/L1C_chips",
+        tie_points_csv="outputs/la/tie_points.csv",
+        calib_json="outputs/la/calibration.json",
         ortho_tif="outputs/la/ortho.tif",
         initial_f=105790.0,
     ),
 
-    # ── Add new scenes here ──────────────────────────────────────────
     # "sicily": SceneConfig(
     #     name="sicily",
     #     phisat_dir="phisat/phisat_sicily",
-    #     ...
+    #     phisat_image="bands/Bp_0_0_4096_4096_0_0_4096_4096_12_RGB.tiff",
+    #     metadata_json="session_2587_metadata.json",
+    #     sentinel_dir="sentinel/sentinel_sicily",
+    #     dem_file="DEM/sicily.tif",
+    #     gcp_json="gcp/sicily/N37E013.json",
+    #     gcp_chip_dir="gcp/sicily/L1C_chips",
+    #     tie_points_csv="outputs/sicily/tie_points.csv",
+    #     calib_json="outputs/sicily/calibration.json",
+    #     ortho_tif="outputs/sicily/ortho.tif",
+    #     initial_f=105790.0,
     # ),
+
+    "sicily": SceneConfig(
+        name="sicily",
+        phisat_dir="phisat/phisat_sicily",
+        phisat_image="bands/Bp_0_0_4096_4096_0_0_4096_4096_12_RGB.tiff",
+        metadata_json="session_2587_metadata.json",
+        sentinel_dir="sentinel/sentinel_sicily_before",
+        dem_file="DEM/sicily.tif",
+        gcp_json="gcp/sicily/N37E013.json",
+        gcp_chip_dir="gcp/sicily/L1C_chips",
+        tie_points_csv="outputs/sicily/tie_points.csv",
+        calib_json="outputs/sicily/calibration.json",
+        ortho_tif="outputs/sicily/ortho.tif",
+        initial_f=105790.0,
+    ),
+
+    "valencia": SceneConfig(
+        name="valencia",
+        phisat_dir="phisat/phisat_valencia",
+        phisat_image="bands/Bp_0_0_4096_4096_0_0_4096_4096_12_RGB.tiff",
+        metadata_json="session_2363_metadata.json",
+        sentinel_dir="sentinel/sentinel_valencia",
+        dem_file="DEM/valencia.tif",
+        gcp_json="gcp/valencia/N41E002.json",
+        gcp_chip_dir="gcp/valencia/L1C_chips",
+        tie_points_csv="outputs/valencia/tie_points.csv",
+        calib_json="outputs/valencia/calibration.json",
+        ortho_tif="outputs/valencia/ortho.tif",
+        initial_f=105790.0,
+    ),
+
+    "spain": SceneConfig(
+        name="spain",
+        phisat_dir="phisat/phisat_spain",
+        phisat_image="bands/Bp_0_0_4096_9050_0_0_4096_9050_12_RGB.tiff",
+        metadata_json="session_2599_metadata.json",
+        sentinel_dir="sentinel/sentinel_spain",
+        dem_file="DEM/spain.tif",
+        gcp_json="gcp/spain/N42W002.json",
+        gcp_chip_dir="gcp/spain/L1C_chips",
+        tie_points_csv="outputs/spain/tie_points.csv",
+        calib_json="outputs/spain/calibration.json",
+        ortho_tif="outputs/spain/ortho.tif",
+        initial_f=105790.0,
+    ),
+
+    "random": SceneConfig(
+        name="random",
+        phisat_dir="phisat/phisat_random",
+        phisat_image="bands/Bp_0_0_4096_4096_0_0_4096_4096_12_RGB.tiff",
+        metadata_json="session_2540_metadata.json",
+        sentinel_dir="sentinel/sentinel_random",
+        dem_file="DEM/random.tif",
+        gcp_json="gcp/random/N44E007.json",
+        gcp_chip_dir="gcp/random/L1C_chips",
+        tie_points_csv="outputs/random/tie_points.csv",
+        calib_json="outputs/random/calibration.json",
+        ortho_tif="outputs/random/ortho.tif",
+        initial_f=105790.0,
+    ),
+
+
+
+    # ── Add new scenes here ──────────────────────────────────────────
 }
 
 
