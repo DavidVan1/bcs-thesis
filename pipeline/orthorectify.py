@@ -74,6 +74,8 @@ class OrthorectificationEngine:
         p = self.calib_params
         self.model.f = p.get("f", self.model.f)
         self.calib_time_shift = p.get("time_shift", 0.0)
+        self.cx_rate = p.get("cx_rate", 0.0)
+        self.along_rate = p.get("along_rate", 0.0)
 
         self.mounting_bias = {
             "roll": p.get("roll", 0.0),
@@ -92,7 +94,9 @@ class OrthorectificationEngine:
         print(f"Calibration: f={self.model.f:.1f}  "
               f"R={self.mounting_bias['roll']:.3f}°  "
               f"P={self.mounting_bias['pitch']:.3f}°  "
-              f"Y={self.mounting_bias['yaw']:.3f}°")
+              f"Y={self.mounting_bias['yaw']:.3f}°  "
+              f"cx_rate={self.cx_rate:.6f}  "
+              f"along_rate={self.along_rate:.6f}")
 
     # ── DEM query ───────────────────────────────────────────────────
 
@@ -117,7 +121,9 @@ class OrthorectificationEngine:
 
     def _forward_biased(self, u: float, v: float) -> Optional[np.ndarray]:
         """Forward-project pixel (u, v) → ECEF using calibrated model."""
-        x_norm = (u - self.model.cx) / self.model.f
+        # Cross-track drift: effective cx shifts linearly with scanline
+        cx_eff = self.model.cx + self.cx_rate * (v - self.model.cy)
+        x_norm = (u - cx_eff) / self.model.f
         r2 = x_norm ** 2
         dist = 1.0 + self.model.k1 * r2 + self.model.k2 * r2 ** 2
         ray_cam = np.array([0.0, x_norm * dist, 1.0])
@@ -126,7 +132,8 @@ class OrthorectificationEngine:
         ray_body = self._rot_bias.apply(ray_cam)
 
         t = self.model.scanline_to_time(v) + self.calib_time_shift
-        sat_pos = self.model.position + self.model.velocity * (t - self.model.t0)
+        dt = t - self.model.t0
+        sat_pos = self.model.position + self.model.velocity * dt * (1.0 + self.along_rate)
 
         R_o2e = self.model.get_orbital_rotation_matrix(
             sat_pos, self.model.velocity)

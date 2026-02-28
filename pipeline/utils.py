@@ -58,7 +58,7 @@ def save_tie_points(tie_points: List[Dict], csv_path: str,
 def load_calibration(json_path: str) -> Dict:
     """
     Load calibration JSON and return a flat dict with keys:
-        f, cx, cy, k1, k2, roll, pitch, yaw, time_shift
+        f, cx, cy, k1, k2, roll, pitch, yaw, time_shift, cx_rate
     """
     with open(json_path) as f:
         data = json.load(f)
@@ -72,10 +72,12 @@ def load_calibration(json_path: str) -> Dict:
         "cy": cam.get("cy", 2048.0),
         "k1": cam.get("k1", 0.0),
         "k2": cam.get("k2", 0.0),
+        "cx_rate": cam.get("cx_rate", 0.0),
         "roll": pose.get("roll", 0.0),
         "pitch": pose.get("pitch", 0.0),
         "yaw": pose.get("yaw", 0.0),
         "time_shift": pose.get("time_shift", 0.0),
+        "along_rate": pose.get("along_rate", 0.0),
     }
 
 
@@ -92,12 +94,14 @@ def save_calibration(calib: Dict, json_path: str,
             "cy": calib["cy"],
             "k1": calib.get("k1", 0.0),
             "k2": calib.get("k2", 0.0),
+            "cx_rate": calib.get("cx_rate", 0.0),
         },
         "pose": {
             "time_shift": calib.get("time_shift", 0.0),
             "roll": calib.get("roll", 0.0),
             "pitch": calib.get("pitch", 0.0),
             "yaw": calib.get("yaw", 0.0),
+            "along_rate": calib.get("along_rate", 0.0),
         },
     }
     if stats:
@@ -173,14 +177,28 @@ def load_satellite_image(path: str) -> Tuple[np.ndarray, rasterio.DatasetReader]
 
 def find_sentinel_band(sentinel_dir: str,
                        band_name: str = "TCI") -> Optional[str]:
-    """Find a Sentinel-2 JP2 band file inside a directory tree."""
+    """Find a Sentinel-2 band file inside a directory tree.
+
+    Supports two layouts:
+    - .SAFE directory tree: searches for *<band_name>*.jp2 (e.g. *TCI*.jp2)
+    - GEE-downloaded GeoTIFF: a single .tif in the directory is used directly
+      when no band-name match is found (band_name is ignored in this case).
+    """
     path = Path(sentinel_dir)
+    valid_exts = {".jp2", ".tif", ".tiff"}
+
+    # First: try to find a file matching the requested band name
     matches = list(path.rglob(f"*{band_name}*.jp2"))
     if not matches:
         matches = list(path.rglob(f"*{band_name}*"))
-    valid_exts = {".jp2", ".tif", ".tiff"}
     matches = [m for m in matches if m.suffix.lower() in valid_exts]
-    return str(matches[0]) if matches else None
+    if matches:
+        return str(matches[0])
+
+    # Fallback: single GeoTIFF (GEE download layout — no band name in filename)
+    tifs = sorted(path.rglob("*.tif")) + sorted(path.rglob("*.tiff"))
+    tifs = [t for t in tifs if t.suffix.lower() in valid_exts]
+    return str(tifs[0]) if tifs else None
 
 
 # ── Metadata helpers ─────────────────────────────────────────────────────

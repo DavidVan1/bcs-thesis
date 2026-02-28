@@ -191,8 +191,14 @@ class RobustModel(PhiSatPushbroomModel):
     Pushbroom model with tuneable parameter vector used by the
     calibration optimizer.
 
-    Parameter vector (7):
-        [time_shift, roll, pitch, yaw, f_scale, k1, k2]
+    Parameter vector (9):
+        [time_shift, roll, pitch, yaw, f_scale, k1, k2, cx_rate, along_rate]
+
+    cx_rate models a linear cross-track drift: the effective principal
+    point shifts as  cx_eff = cx + cx_rate · (py − cy).
+
+    along_rate corrects a linear along-track ephemeris error by scaling
+    the orbit propagation time:  sat_pos = pos + vel · dt · (1 + along_rate).
     """
 
     def predict_with_params(self, px: float, py: float,
@@ -201,10 +207,14 @@ class RobustModel(PhiSatPushbroomModel):
         t_shift, r, p, y = params[0], params[1], params[2], params[3]
         f_scale = params[4]
         k1, k2 = params[5], params[6]
+        cx_rate = params[7] if len(params) > 7 else 0.0
+        along_rate = params[8] if len(params) > 8 else 0.0
 
         current_f = self.f * f_scale
 
-        x_norm = (px - self.cx) / current_f
+        # Cross-track drift: effective cx shifts linearly with scanline
+        cx_eff = self.cx + cx_rate * (py - self.cy)
+        x_norm = (px - cx_eff) / current_f
         y_norm = 0.0
 
         r2 = x_norm**2 + y_norm**2
@@ -219,7 +229,8 @@ class RobustModel(PhiSatPushbroomModel):
         ray_body = rot.apply(ray_cam)
 
         t = self.scanline_to_time(py) + t_shift
-        sat_pos = self.position + self.velocity * (t - self.t0)
+        dt = t - self.t0
+        sat_pos = self.position + self.velocity * dt * (1.0 + along_rate)
 
         R_b2o = self.quaternion_to_rotation_matrix(self.quaternion)
         R_o2e = self.get_orbital_rotation_matrix(sat_pos, self.velocity)

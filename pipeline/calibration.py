@@ -5,8 +5,8 @@ Phase 1 – Soft-L1 robust optimisation (tolerant to outliers)
 Phase 2 – 3-σ outlier removal
 Phase 3 – Final linear least-squares refinement on clean inliers
 
-Parameter vector (7):
-    [time_shift, roll, pitch, yaw, f_scale, k1, k2]
+Parameter vector (9):
+    [time_shift, roll, pitch, yaw, f_scale, k1, k2, cx_rate, along_rate]
 """
 
 import json
@@ -60,7 +60,7 @@ def run_calibration(config: SceneConfig,
 
     Returns
     -------
-    dict with keys: f, cx, cy, k1, k2, roll, pitch, yaw, time_shift
+    dict with keys: f, cx, cy, k1, k2, roll, pitch, yaw, time_shift, cx_rate
     Also saves the JSON to config.calib_json.
     """
     missing = config.check_inputs("calibration")
@@ -79,10 +79,10 @@ def run_calibration(config: SceneConfig,
     all_points = load_tie_points(str(config.tie_points_path))
     print(f"Loaded {len(all_points)} tie points.")
 
-    # Bounds: [t_shift, roll, pitch, yaw, f_scale, k1, k2]
-    x0 = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
-    lower = [-60.0, -5.0, -5.0, -5.0, 0.8, -1e-8, -1e-8]
-    upper = [ 60.0,  5.0,  5.0,  5.0, 1.2,  1e-8,  1e-8]
+    # Bounds: [t_shift, roll, pitch, yaw, f_scale, k1, k2, cx_rate, along_rate]
+    x0 = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    lower = [-60.0, -5.0, -5.0, -5.0, 0.8, -1e-8, -1e-8, -1.0, -0.1]
+    upper = [ 60.0,  5.0,  5.0,  5.0, 1.2,  1e-8,  1e-8,  1.0,  0.1]
 
     # ── Phase 1: Robust (Soft L1) ──
     print("\n--- Phase 1: Robust Optimisation (Soft L1) ---")
@@ -133,6 +133,8 @@ def run_calibration(config: SceneConfig,
     print(f"Yaw        : {p[3]:.4f}°")
     print(f"Focal Len  : {refined_f:.1f} px (scale {p[4]:.4f})")
     print(f"Distortion : k1={p[5]:.6f}  k2={p[6]:.6f}")
+    print(f"CX Rate    : {p[7]:.6f} px/line")
+    print(f"Along Rate : {p[8]:.6f}")
     print(f"RMSE       : {final_rmse:.1f} m")
 
     calib = {
@@ -145,6 +147,8 @@ def run_calibration(config: SceneConfig,
         "roll": p[1],
         "pitch": p[2],
         "yaw": p[3],
+        "cx_rate": p[7],
+        "along_rate": p[8],
     }
 
     stats = {
