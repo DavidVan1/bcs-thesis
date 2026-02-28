@@ -39,6 +39,9 @@ dependencies:
     - affine>=2.4
     - yacs
     - pycolmap
+    # Data fetching (Google Earth Engine + Copernicus)
+    - earthengine-api
+    - geedim
     # Third-party matcher dependencies
     - -r third_party/LightGlue/requirements.txt
     - -r third_party/RoMa/requirements.txt
