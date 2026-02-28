@@ -9,13 +9,14 @@ conversion, tensor format) and rescales output keypoints back to the
 
 Supported matchers
 ------------------
-* ``lightglue``   – SuperPoint + LightGlue  (sparse)
-* ``aliked``      – ALIKED + LightGlue      (sparse)
-* ``xoftr``       – XoFTR                    (dense)
-* ``loftr``       – MiniMA-LoFTR             (dense)
-* ``roma``        – MiniMA-RoMa              (dense)
-* ``mast3r``      – MASt3R                   (dense 3-D)
-* ``dust3r``      – DUSt3R                   (dense 3-D)
+* ``lightglue``       – SuperPoint + LightGlue  (sparse)
+* ``aliked``          – ALIKED + LightGlue      (sparse)
+* ``xoftr``           – XoFTR                    (dense)
+* ``loftr``           – MiniMA-LoFTR             (dense)
+* ``efficientloftr``  – EfficientLoFTR           (dense)
+* ``roma``            – MiniMA-RoMa              (dense)
+* ``mast3r``          – MASt3R                   (dense 3-D)
+* ``dust3r``          – DUSt3R                   (dense 3-D)
 
 Use :func:`get_matcher` as the single entry point::
 
@@ -283,6 +284,67 @@ class LoFTRMatcher(BaseMatcher):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# EfficientLoFTR  (dense, grayscale)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class EfficientLoFTRMatcher(BaseMatcher):
+    """EfficientLoFTR — fast LoFTR variant with RepVGG backbone (grayscale, 832×832)."""
+    name = "efficientloftr"
+
+    _WIDTH, _HEIGHT = 832, 832
+    _DFACTOR = 32  # backbone stride (8) × aggregation size (4)
+
+    def __init__(self, device: str = "cuda", max_keypoints: int = 2000):
+        super().__init__(device, max_keypoints)
+        _eloftr_root = _TP / "EfficientLoFTR"
+        _ensure_path(str(_eloftr_root))
+
+        from src.config.default import get_cfg_defaults  # noqa
+        from src.utils.misc import lower_config  # noqa
+        from src.loftr import LoFTR as ELoFTR  # noqa
+        from src.loftr.loftr import reparameter  # noqa
+
+        # Build config (full model, outdoor weights)
+        config = get_cfg_defaults()
+        cfg_path = _eloftr_root / "configs" / "loftr" / "eloftr_full.py"
+        config.merge_from_file(str(cfg_path))
+        config.LOFTR.COARSE.NPE = [832, 832, self._WIDTH, self._HEIGHT]
+        _config = lower_config(config)
+
+        # Instantiate and load weights
+        ckpt_path = _eloftr_root / "weights" / "eloftr_outdoor.ckpt"
+        state_dict = torch.load(str(ckpt_path), map_location="cpu")["state_dict"]
+        self.net = ELoFTR(config=_config["loftr"])
+        self.net.load_state_dict(state_dict, strict=False)
+        self.net = reparameter(self.net)
+        self.net.eval().to(device)
+        print(f"  EfficientLoFTR on {device}")
+
+    def match(self, img0, img1):
+        img0r, sc0 = _resize_divisible(img0, 1024, self._DFACTOR,
+                                        force_size=(self._WIDTH, self._HEIGHT))
+        img1r, sc1 = _resize_divisible(img1, 1024, self._DFACTOR,
+                                        force_size=(self._WIDTH, self._HEIGHT))
+        t0 = _to_grayscale_tensor(img0r, self.device)
+        t1 = _to_grayscale_tensor(img1r, self.device)
+        data = {"image0": t0, "image1": t1}
+        with torch.no_grad():
+            self.net(data)
+        kp0 = data["mkpts0_f"].cpu().numpy()
+        kp1 = data["mkpts1_f"].cpu().numpy()
+        conf = data.get("mconf", torch.ones(len(kp0))).cpu().numpy()
+        if len(kp0) == 0:
+            return _empty()
+        # Top-k by confidence
+        if len(kp0) > self.max_keypoints:
+            idx = np.argsort(conf)[::-1][: self.max_keypoints]
+            kp0, kp1, conf = kp0[idx], kp1[idx], conf[idx]
+        return {"keypoints0": _rescale_keypoints(kp0, sc0),
+                "keypoints1": _rescale_keypoints(kp1, sc1),
+                "confidence": conf}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # RoMa / MiniMA-RoMa  (dense, RGB)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -414,13 +476,14 @@ class DUSt3RMatcher(BaseMatcher):
 # ═══════════════════════════════════════════════════════════════════════════
 
 _REGISTRY: dict[str, type[BaseMatcher]] = {
-    "lightglue": LightGlueMatcher,
-    "aliked":    ALIKEDLightGlueMatcher,
-    "xoftr":     XoFTRMatcher,
-    "loftr":     LoFTRMatcher,
-    "roma":      RoMAMatcher,
-    "mast3r":    MASt3RMatcher,
-    "dust3r":    DUSt3RMatcher,
+    "lightglue":      LightGlueMatcher,
+    "aliked":         ALIKEDLightGlueMatcher,
+    "xoftr":          XoFTRMatcher,
+    "loftr":          LoFTRMatcher,
+    "efficientloftr": EfficientLoFTRMatcher,
+    "roma":           RoMAMatcher,
+    "mast3r":         MASt3RMatcher,
+    "dust3r":         DUSt3RMatcher,
 }
 
 
@@ -438,7 +501,7 @@ def get_matcher(name: str, *,
     Parameters
     ----------
     name : str
-        One of: lightglue, aliked, xoftr, loftr, roma, mast3r, dust3r.
+        One of: lightglue, aliked, xoftr, loftr, efficientloftr, roma, mast3r, dust3r.
     device : str
         ``"cpu"`` or ``"cuda"``.
     max_keypoints : int
