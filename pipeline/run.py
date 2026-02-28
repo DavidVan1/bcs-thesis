@@ -6,13 +6,17 @@ Usage:
 
 Examples:
     python -m pipeline.run sf                      # Run all stages
+    python -m pipeline.run sf fetch                # Download Sentinel-2, DEM, GCPs
     python -m pipeline.run sf match                # Matching only
     python -m pipeline.run sf match --matcher xoftr
     python -m pipeline.run la calibrate
     python -m pipeline.run sf orthorectify
     python -m pipeline.run sf verify
 
-Available matchers: lightglue, aliked, xoftr, loftr, roma, mast3r, dust3r
+    # New scene from a PhiSat folder (no config entry needed):
+    python -m pipeline.run my_scene fetch --phisat-dir phisat/phisat_my_scene
+
+Available matchers: lightglue, aliked, xoftr, loftr, efficientloftr, roma, mast3r, dust3r
 """
 
 import argparse
@@ -23,7 +27,13 @@ from .config import get_scene_config, list_scenes, SceneConfig
 from .matchers import list_matchers
 
 
-STAGES = ["all", "match", "calibrate", "orthorectify", "verify"]
+STAGES = ["all", "fetch", "match", "calibrate", "orthorectify", "verify"]
+
+
+def run_fetch_stage(config: SceneConfig) -> None:
+    """Download Sentinel-2, DEM and GCPs from Google Earth Engine / Copernicus."""
+    from .fetch import run_fetch
+    run_fetch(config)
 
 
 def run_match(config: SceneConfig, matcher_name: str) -> None:
@@ -51,7 +61,7 @@ def run_verify(config: SceneConfig) -> None:
 
 
 def run_all(config: SceneConfig, matcher_name: str) -> None:
-    """Run the complete pipeline: match → calibrate → orthorectify → verify."""
+    """Run the complete pipeline: fetch → match → calibrate → orthorectify → verify."""
     print("\n" + "=" * 70)
     print(f"  PHISAT-2 ORTHORECTIFICATION PIPELINE — scene '{config.name}'")
     print("=" * 70 + "\n")
@@ -101,6 +111,22 @@ def main():
         action="store_true",
         help="List available matchers and exit."
     )
+    parser.add_argument(
+        "--phisat-dir",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to the PhiSat folder relative to project root "
+            "(e.g. phisat/phisat_new).  Required for 'fetch' when the scene "
+            "is not yet listed in config.py."
+        ),
+    )
+    parser.add_argument(
+        "--no-gcp-chips",
+        action="store_true",
+        help="Skip downloading GCP reference chips during fetch.",
+    )
 
     args = parser.parse_args()
 
@@ -116,12 +142,35 @@ def main():
             print(f"  - {m}")
         sys.exit(0)
 
-    # Load scene config
+    # ── Load or build scene config ─────────────────────────────────
+    from .config import SceneConfig, PROJECT_ROOT
+
     try:
         config = get_scene_config(args.scene)
-    except KeyError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    except KeyError:
+        # Scene not in config.py — allow fetch to bootstrap it
+        if args.stage == "fetch" and args.phisat_dir:
+            phisat_dir = args.phisat_dir
+            image_rel = "bands/Bp_0_0_4096_4096_0_0_4096_4096_12_RGB.tiff"
+            # Auto-detect image file
+            from .fetch import _find_phisat_image as _fpi
+            tmp = SceneConfig(
+                name=args.scene,
+                phisat_dir=phisat_dir,
+                phisat_image=image_rel,
+            )
+            _fpi(tmp)
+            config = tmp
+        else:
+            print(
+                f"Error: Unknown scene '{args.scene}'.\n"
+                f"  Available scenes: {', '.join(list_scenes())}\n"
+                f"  To fetch data for a new scene, run:\n"
+                f"    python -m pipeline.run {args.scene} fetch "
+                f"--phisat-dir phisat/phisat_{args.scene}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Set matcher-specific output paths
     config.set_matcher(args.matcher)
@@ -131,6 +180,10 @@ def main():
 
     if stage == "all":
         run_all(config, args.matcher)
+    elif stage == "fetch":
+        no_chips = getattr(args, "no_gcp_chips", False)
+        from .fetch import run_fetch
+        run_fetch(config, no_gcp_chips=no_chips)
     elif stage == "match":
         run_match(config, args.matcher)
     elif stage == "calibrate":
