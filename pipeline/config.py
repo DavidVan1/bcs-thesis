@@ -336,7 +336,73 @@ SCENES = {
         initial_f=105790.0,
     ),
 
+    # ── Red-band scenes (PhiSat band 3 + Sentinel B04) ──────────────
 
+    "sf_red": SceneConfig(
+        name="sf_red",
+        phisat_dir="phisat/phisat_sf",
+        phisat_image="bands/Bp_0_0_4096_4096_0_0_4096_4096_12_3.tiff",
+        metadata_json="session_3817_metadata.json",
+        sentinel_dir="sentinel/sentinel_sf_before",
+        sentinel_band="B04",
+        dem_file="DEM/sf.tif",
+        gcp_json="gcp/sf/N37W123.json",
+        gcp_chip_dir="gcp/sf/L1C_chips",
+        tie_points_csv="outputs/sf_red/tie_points.csv",
+        calib_json="outputs/sf_red/calibration.json",
+        ortho_tif="outputs/sf_red/ortho.tif",
+        initial_f=105790.0,
+    ),
+
+    "la_red": SceneConfig(
+        name="la_red",
+        phisat_dir="phisat/phisat_la",
+        phisat_image="bands/Bp_0_0_4096_4096_0_0_4096_4096_12_3.tiff",
+        metadata_json="session_2532_metadata.json",
+        sentinel_dir="sentinel/sentinel_la_before",
+        sentinel_band="B04",
+        dem_file="DEM/la.tif",
+        gcp_json="gcp/la/N33W119.json",
+        gcp_chip_dir="gcp/la/L1C_chips",
+        tie_points_csv="outputs/la_red/tie_points.csv",
+        calib_json="outputs/la_red/calibration.json",
+        ortho_tif="outputs/la_red/ortho.tif",
+        initial_f=105790.0,
+    ),
+
+    # ── TCI from SAFE (same acquisition as _red, for fair comparison) ─
+
+    "sf_tci_safe": SceneConfig(
+        name="sf_tci_safe",
+        phisat_dir="phisat/phisat_sf",
+        phisat_image="bands/Bp_0_0_4096_4096_0_0_4096_4096_12_RGB.tiff",
+        metadata_json="session_3817_metadata.json",
+        sentinel_dir="sentinel/sentinel_sf_before",
+        sentinel_band="TCI",
+        dem_file="DEM/sf.tif",
+        gcp_json="gcp/sf/N37W123.json",
+        gcp_chip_dir="gcp/sf/L1C_chips",
+        tie_points_csv="outputs/sf_tci_safe/tie_points.csv",
+        calib_json="outputs/sf_tci_safe/calibration.json",
+        ortho_tif="outputs/sf_tci_safe/ortho.tif",
+        initial_f=105790.0,
+    ),
+
+    "la_tci_safe": SceneConfig(
+        name="la_tci_safe",
+        phisat_dir="phisat/phisat_la",
+        phisat_image="bands/Bp_0_0_4096_4096_0_0_4096_4096_12_RGB.tiff",
+        metadata_json="session_2532_metadata.json",
+        sentinel_dir="sentinel/sentinel_la_before",
+        sentinel_band="TCI",
+        dem_file="DEM/la.tif",
+        gcp_json="gcp/la/N33W119.json",
+        gcp_chip_dir="gcp/la/L1C_chips",
+        tie_points_csv="outputs/la_tci_safe/tie_points.csv",
+        calib_json="outputs/la_tci_safe/calibration.json",
+        ortho_tif="outputs/la_tci_safe/ortho.tif",
+        initial_f=105790.0,
+    ),
 
     # ── Add new scenes here ──────────────────────────────────────────
 }

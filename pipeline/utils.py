@@ -192,6 +192,10 @@ def find_sentinel_band(sentinel_dir: str,
     if not matches:
         matches = list(path.rglob(f"*{band_name}*"))
     matches = [m for m in matches if m.suffix.lower() in valid_exts]
+    # Prefer files in IMG_DATA over QI_DATA (masks)
+    img_data = [m for m in matches if "IMG_DATA" in str(m)]
+    if img_data:
+        matches = img_data
     if matches:
         return str(matches[0])
 

@@ -186,7 +186,7 @@ def _load_gcps(gcp_path: Path, chip_dir: Path,
 # Public API
 # ═══════════════════════════════════════════════════════════════════════════
 
-def run_verification(config: SceneConfig, min_ncc: float = 0.15) -> dict:
+def run_verification(config: SceneConfig, min_ncc: float = 0.3) -> dict:
     """
     Run GCP verification for a scene.
 

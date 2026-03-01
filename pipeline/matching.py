@@ -52,8 +52,10 @@ def reproject_sentinel_to_phisat(
 
     print(f"  Target grid: {new_w}×{new_h}")
 
-    dest = np.zeros((3, new_h, new_w), dtype=np.uint8)
+    # Reproject in the source dtype to avoid clipping uint16→uint8
+    src_dtype = sentinel_ds.dtypes[0]
     bands = [1, 2, 3] if sentinel_ds.count >= 3 else [1]
+    dest = np.zeros((3, new_h, new_w), dtype=np.dtype(src_dtype))
 
     for i, band_idx in enumerate(bands):
         idx = i if len(bands) > 1 else 0
@@ -70,7 +72,12 @@ def reproject_sentinel_to_phisat(
             dest[1] = dest[0]
             dest[2] = dest[0]
 
-    return np.transpose(dest, (1, 2, 0)), dst_transform
+    # Normalise to uint8
+    out = np.transpose(dest, (1, 2, 0))
+    if out.dtype != np.uint8:
+        out = cv2.normalize(out, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    return out, dst_transform
 
 
 # ── RANSAC filter ──────────────────────────────────────────────────────
