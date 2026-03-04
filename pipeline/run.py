@@ -54,10 +54,10 @@ def run_orthorectify_stage(config: SceneConfig) -> None:
     run_orthorectify(config)
 
 
-def run_verify(config: SceneConfig) -> None:
-    """Run GCP-based verification."""
+def run_verify(config: SceneConfig, method: str = "all") -> None:
+    """Run GCP-based verification (position / NCC or both)."""
     from .verify import run_verification
-    run_verification(config)
+    run_verification(config, method=method)
 
 
 def run_all(config: SceneConfig, matcher_name: str) -> None:
@@ -69,7 +69,7 @@ def run_all(config: SceneConfig, matcher_name: str) -> None:
     run_match(config, matcher_name)
     run_calibrate(config)
     run_orthorectify_stage(config)
-    run_verify(config)
+    run_verify(config, method="all")
 
     print("\n" + "=" * 70)
     print("  PIPELINE COMPLETE")
@@ -126,6 +126,16 @@ def main():
         "--no-gcp-chips",
         action="store_true",
         help="Skip downloading GCP reference chips during fetch.",
+    )
+    parser.add_argument(
+        "--verify-method",
+        type=str,
+        default="all",
+        choices=["all", "position", "ncc"],
+        help=(
+            "Verification method: 'position' (A), 'ncc' (B), "
+            "or 'all'. Default: all."
+        ),
     )
 
     args = parser.parse_args()
@@ -191,7 +201,7 @@ def main():
     elif stage == "orthorectify":
         run_orthorectify_stage(config)
     elif stage == "verify":
-        run_verify(config)
+        run_verify(config, method=args.verify_method)
     else:
         print(f"Unknown stage: {stage}", file=sys.stderr)
         sys.exit(1)

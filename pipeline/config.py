@@ -45,6 +45,7 @@ class SceneConfig:
 
     # Outputs  (all stored under outputs/<name>/)
     ortho_tif: Optional[str] = None       # e.g. "outputs/sf/phisat_ortho.tif"
+    verification_json: Optional[str] = None  # set by set_matcher()
 
     # Camera defaults
     initial_f: float = 105790.0
@@ -136,6 +137,8 @@ class SceneConfig:
 
     @property
     def verification_json_path(self) -> Path:
+        if self.verification_json:
+            return self.root / self.verification_json
         return self.output_dir / "verification_results.json"
 
     def set_matcher(self, matcher_name: str) -> None:
@@ -147,9 +150,10 @@ class SceneConfig:
         ``outputs/sf/calibration_xoftr.json``, etc.
         """
         od = f"outputs/{self.name}"
-        self.tie_points_csv  = f"{od}/tie_points_{matcher_name}.csv"
-        self.calib_json      = f"{od}/calibration_{matcher_name}.json"
-        self.ortho_tif       = f"{od}/ortho_{matcher_name}.tif"
+        self.tie_points_csv      = f"{od}/tie_points_{matcher_name}.csv"
+        self.calib_json          = f"{od}/calibration_{matcher_name}.json"
+        self.ortho_tif           = f"{od}/ortho_{matcher_name}.tif"
+        self.verification_json   = f"{od}/verification_{matcher_name}.json"
 
     def check_inputs(self, stage: str = "all") -> List[str]:
         """Return list of missing files for a given pipeline stage."""
