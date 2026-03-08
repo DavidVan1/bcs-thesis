@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import cv2
+import logging
 import numpy as np
 import torch
 import torchvision.transforms.functional as TF
@@ -39,6 +40,8 @@ import torchvision.transforms.functional as TF
 # ── Paths into third_party/ ──────────────────────────────────────────────
 _TP = Path(__file__).resolve().parent.parent / "third_party"
 _HLOC = _TP / "hloc"
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_path(*dirs: Path) -> None:
@@ -145,7 +148,7 @@ class LightGlueMatcher(BaseMatcher):
         super().__init__(device, max_keypoints)
         _ensure_path(_TP / "LightGlue")
         from lightglue import LightGlue, SuperPoint  # noqa
-        print(f"  LightGlue on {device}")
+        logger.info("  LightGlue on %s", device)
         self.extractor = SuperPoint(max_num_keypoints=max_keypoints).eval().to(device)
         self.matcher = LightGlue(features="superpoint").eval().to(device)
 
@@ -177,7 +180,7 @@ class ALIKEDLightGlueMatcher(BaseMatcher):
         super().__init__(device, max_keypoints)
         _ensure_path(_TP / "LightGlue")
         from lightglue import LightGlue, ALIKED  # noqa
-        print(f"  ALIKED + LightGlue on {device}")
+        logger.info("  ALIKED + LightGlue on %s", device)
         self.extractor = ALIKED(max_num_keypoints=max_keypoints).eval().to(device)
         self.matcher = LightGlue(features="aliked").eval().to(device)
 
@@ -219,7 +222,7 @@ class XoFTRMatcher(BaseMatcher):
             "max_keypoints": max_keypoints,
         }
         self.net = XoFTR(conf).eval().to(device)
-        print(f"  XoFTR on {device}")
+        logger.info("  XoFTR on %s", device)
 
     def match(self, img0, img1):
         img0r, sc0 = _resize_divisible(img0, 1024, self._DFACTOR,
@@ -262,7 +265,7 @@ class LoFTRMatcher(BaseMatcher):
             "match_threshold": 0.2,
         }
         self.net = LoFTR(conf).eval().to(device)
-        print(f"  MiniMA-LoFTR on {device}")
+        logger.info("  MiniMA-LoFTR on %s", device)
 
     def match(self, img0, img1):
         img0r, sc0 = _resize_divisible(img0, 1024, self._DFACTOR,
@@ -318,7 +321,7 @@ class EfficientLoFTRMatcher(BaseMatcher):
         self.net.load_state_dict(state_dict, strict=False)
         self.net = reparameter(self.net)
         self.net.eval().to(device)
-        print(f"  EfficientLoFTR on {device}")
+        logger.info("  EfficientLoFTR on %s", device)
 
     def match(self, img0, img1):
         img0r, sc0 = _resize_divisible(img0, 1024, self._DFACTOR,
@@ -367,7 +370,7 @@ class RoMAMatcher(BaseMatcher):
             "upsample_res": (864, 1152),
         }
         self.net = Roma(conf).eval().to(device)
-        print(f"  MiniMA-RoMa on {device}")
+        logger.info("  MiniMA-RoMa on %s", device)
 
     def match(self, img0, img1):
         # RoMa handles its own internal resizing, but we still
@@ -412,7 +415,7 @@ class MASt3RMatcher(BaseMatcher):
             "vit_patch_size": 16,
         }
         self.net = Mast3r(conf).eval().to(device)
-        print(f"  MASt3R on {device}")
+        logger.info("  MASt3R on %s", device)
 
     def match(self, img0, img1):
         img0r, sc0 = _resize_divisible(img0, self._MAX_SIDE, self._DFACTOR)
@@ -445,14 +448,14 @@ class DUSt3RMatcher(BaseMatcher):
     def __init__(self, device: str = "cuda", max_keypoints: int = 2000):
         super().__init__(device, max_keypoints)
         _ensure_path(_TP, _TP / "dust3r")
-        from hloc.matchers.duster import Duster  # noqa
+        from hloc.matchers.duster import Duster
         conf = {
             "model_name": "duster_vit_large.pth",
             "max_keypoints": max_keypoints,
             "vit_patch_size": 16,
         }
         self.net = Duster(conf).eval().to(device)
-        print(f"  DUSt3R on {device}")
+        logger.info("  DUSt3R on %s", device)
 
     def match(self, img0, img1):
         img0r, sc0 = _resize_divisible(img0, self._MAX_SIDE, self._DFACTOR)
