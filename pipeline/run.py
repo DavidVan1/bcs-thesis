@@ -20,14 +20,26 @@ Available matchers: lightglue, aliked, xoftr, loftr, efficientloftr, roma, mast3
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 from .config import get_scene_config, list_scenes, SceneConfig
-from .matchers import list_matchers
+
+logger = logging.getLogger(__name__)
 
 
 STAGES = ["all", "fetch", "match", "calibrate", "orthorectify", "verify"]
+MATCHER_CHOICES = [
+    "lightglue",
+    "aliked",
+    "xoftr",
+    "loftr",
+    "efficientloftr",
+    "roma",
+    "mast3r",
+    "dust3r",
+]
 
 
 def run_fetch_stage(config: SceneConfig) -> None:
@@ -54,26 +66,32 @@ def run_orthorectify_stage(config: SceneConfig) -> None:
     run_orthorectify(config)
 
 
-def run_verify(config: SceneConfig, method: str = "all") -> None:
+def run_verify(config: SceneConfig,
+               method: str = "all",
+               reference_source: str = "sentinel") -> None:
     """Run GCP-based verification (position / NCC or both)."""
     from .verify import run_verification
-    run_verification(config, method=method)
+    run_verification(config, method=method,
+                     reference_source=reference_source)
 
 
-def run_all(config: SceneConfig, matcher_name: str) -> None:
+def run_all(config: SceneConfig,
+            matcher_name: str,
+            reference_source: str = "sentinel") -> None:
     """Run the complete pipeline: fetch → match → calibrate → orthorectify → verify."""
-    print("\n" + "=" * 70)
-    print(f"  PHISAT-2 ORTHORECTIFICATION PIPELINE — scene '{config.name}'")
-    print("=" * 70 + "\n")
+    logger.info("\n" + "=" * 70)
+    logger.info("  PHISAT-2 ORTHORECTIFICATION PIPELINE — scene '%s'", config.name)
+    logger.info("=" * 70 + "\n")
 
+    run_fetch_stage(config)
     run_match(config, matcher_name)
     run_calibrate(config)
     run_orthorectify_stage(config)
-    run_verify(config, method="all")
+    run_verify(config, method="all", reference_source=reference_source)
 
-    print("\n" + "=" * 70)
-    print("  PIPELINE COMPLETE")
-    print("=" * 70 + "\n")
+    logger.info("\n" + "=" * 70)
+    logger.info("  PIPELINE COMPLETE")
+    logger.info("=" * 70 + "\n")
 
 
 def main():
@@ -84,6 +102,7 @@ def main():
     )
     parser.add_argument(
         "scene",
+        nargs="?",
         type=str,
         help=f"Scene name. Available: {', '.join(list_scenes())}"
     )
@@ -98,8 +117,8 @@ def main():
         "--matcher", "-m",
         type=str,
         default="lightglue",
-        choices=list_matchers(),
-        help=f"Feature matcher. Default: lightglue. Options: {', '.join(list_matchers())}"
+        choices=MATCHER_CHOICES,
+        help=f"Feature matcher. Default: lightglue. Options: {', '.join(MATCHER_CHOICES)}"
     )
     parser.add_argument(
         "--list-scenes",
@@ -128,6 +147,11 @@ def main():
         help="Skip downloading GCP reference chips during fetch.",
     )
     parser.add_argument(
+        "--no-us-mapping",
+        action="store_true",
+        help="Skip downloading free US national mapping ortho (NAIP) during fetch.",
+    )
+    parser.add_argument(
         "--verify-method",
         type=str,
         default="all",
@@ -137,20 +161,39 @@ def main():
             "or 'all'. Default: all."
         ),
     )
+    parser.add_argument(
+        "--reference-source",
+        type=str,
+        default="sentinel",
+        choices=["sentinel", "us_naip"],
+        help=(
+            "Reference source for NCC verification: 'sentinel' uses ESA GCP "
+            "chips, 'us_naip' uses fetched US national ortho patches. "
+            "Default: sentinel."
+        ),
+    )
 
     args = parser.parse_args()
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+    )
+
     if args.list_scenes:
-        print("Available scenes:")
+        logger.info("Available scenes:")
         for s in list_scenes():
-            print(f"  - {s}")
+            logger.info("  - %s", s)
         sys.exit(0)
 
     if args.list_matchers:
-        print("Available matchers:")
-        for m in list_matchers():
-            print(f"  - {m}")
+        logger.info("Available matchers:")
+        for m in MATCHER_CHOICES:
+            logger.info("  - %s", m)
         sys.exit(0)
+
+    if not args.scene:
+        parser.error("the following arguments are required: scene")
 
     # ── Load or build scene config ─────────────────────────────────
     from .config import SceneConfig, PROJECT_ROOT
@@ -172,13 +215,14 @@ def main():
             _fpi(tmp)
             config = tmp
         else:
-            print(
-                f"Error: Unknown scene '{args.scene}'.\n"
-                f"  Available scenes: {', '.join(list_scenes())}\n"
-                f"  To fetch data for a new scene, run:\n"
-                f"    python -m pipeline.run {args.scene} fetch "
-                f"--phisat-dir phisat/phisat_{args.scene}",
-                file=sys.stderr,
+            logger.error(
+                "Error: Unknown scene '%s'.\n"
+                "  Available scenes: %s\n"
+                "  To fetch data for a new scene, run:\n"
+                "    python -m pipeline.run %s fetch "
+                "--phisat-dir phisat/phisat_%s",
+                args.scene, ', '.join(list_scenes()),
+                args.scene, args.scene,
             )
             sys.exit(1)
 
@@ -189,11 +233,15 @@ def main():
     stage = args.stage
 
     if stage == "all":
-        run_all(config, args.matcher)
+        run_all(config, args.matcher,
+            reference_source=args.reference_source)
     elif stage == "fetch":
         no_chips = getattr(args, "no_gcp_chips", False)
+        no_us_mapping = getattr(args, "no_us_mapping", False)
         from .fetch import run_fetch
-        run_fetch(config, no_gcp_chips=no_chips)
+        run_fetch(config,
+                  no_gcp_chips=no_chips,
+                  fetch_us_mapping=not no_us_mapping)
     elif stage == "match":
         run_match(config, args.matcher)
     elif stage == "calibrate":
@@ -201,9 +249,10 @@ def main():
     elif stage == "orthorectify":
         run_orthorectify_stage(config)
     elif stage == "verify":
-        run_verify(config, method=args.verify_method)
+        run_verify(config, method=args.verify_method,
+                   reference_source=args.reference_source)
     else:
-        print(f"Unknown stage: {stage}", file=sys.stderr)
+        logger.error("Unknown stage: %s", stage)
         sys.exit(1)
 
 
