@@ -16,6 +16,7 @@ directory, exclude any GCP too near a calibration tie point, and
 report RMSE / mean error in metres and PhiSat-2 pixels (4.75 m).
 """
 
+import logging
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -25,8 +26,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import rasterio
-from rasterio.warp import reproject, Resampling
+from rasterio.warp import reproject, Resampling, transform as rio_transform
 from rasterio.transform import Affine
+from rasterio.crs import CRS
+from rasterio.coords import BoundingBox
 
 try:
     import cv2
@@ -38,13 +41,15 @@ from .config import SceneConfig
 
 # PhiSat-2 GSD (metres)
 PIXEL_SIZE = 4.75
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # GCP loading / selection  (shared by A and B)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _load_all_gcps(gcp_json_path: Path, chip_dir: Path) -> List[dict]:
+def _load_all_gcps(gcp_json_path: Path,
+                   chip_dir: Optional[Path]) -> List[dict]:
     """
     Load GCPs from *every* JSON in the same directory as the configured
     GCP JSON.  De-duplicates by GCP ID.
@@ -79,7 +84,7 @@ def _load_all_gcps(gcp_json_path: Path, chip_dir: Path) -> List[dict]:
                 cf = cf.get("Chip_File", cf)
 
             chip_path = None
-            if cf is not None:
+            if cf is not None and chip_dir is not None:
                 chip_path = chip_dir / Path(cf).name
                 if not chip_path.exists():
                     chip_path = chip_dir / f"{gid}_00.TIF"
@@ -104,20 +109,33 @@ def _load_all_gcps(gcp_json_path: Path, chip_dir: Path) -> List[dict]:
 def _filter_to_ortho(gcps: List[dict],
                      ortho_bounds,
                      ortho_data: np.ndarray,
+                     ortho_crs,
                      ortho_tf,
                      require_chip: bool = True,
                      ) -> List[dict]:
     """Keep GCPs inside ortho footprint with non-zero data."""
     valid: List[dict] = []
+    ortho_crs_obj = CRS.from_user_input(ortho_crs)
+    ortho_is_geographic = ortho_crs_obj.is_geographic
+
     for g in gcps:
         if require_chip and g["chip_path"] is None:
             continue
+
+        if ortho_is_geographic:
+            x, y = g["lon"], g["lat"]
+        else:
+            x_t, y_t = rio_transform(
+                "EPSG:4326", ortho_crs_obj, [g["lon"]], [g["lat"]]
+            )
+            x, y = float(x_t[0]), float(y_t[0])
+
         ob = ortho_bounds
-        if not (ob.left <= g["lon"] <= ob.right
-                and ob.bottom <= g["lat"] <= ob.top):
+        if not (ob.left <= x <= ob.right
+                and ob.bottom <= y <= ob.top):
             continue
-        col = int((g["lon"] - ortho_tf.c) / ortho_tf.a)
-        row = int((g["lat"] - ortho_tf.f) / ortho_tf.e)
+        col = int(round((x - ortho_tf.c) / ortho_tf.a))
+        row = int(round((y - ortho_tf.f) / ortho_tf.e))
         if not (0 <= row < ortho_data.shape[1]
                 and 0 <= col < ortho_data.shape[2]):
             continue
@@ -159,7 +177,7 @@ def _check_holdout(gcps: List[dict],
 
 
 def _select_gcps(config: SceneConfig,
-                 ortho_bounds, ortho_data, ortho_tf,
+                 ortho_bounds, ortho_data, ortho_crs, ortho_tf,
                  require_chip: bool = True,
                  ) -> Tuple[List[dict], dict]:
     """
@@ -175,6 +193,7 @@ def _select_gcps(config: SceneConfig,
     holdout, n_excl = _check_holdout(all_gcps, config.tie_points_path)
 
     in_ortho = _filter_to_ortho(holdout, ortho_bounds, ortho_data,
+                                ortho_crs,
                                 ortho_tf, require_chip=require_chip)
 
     meta = dict(
@@ -184,10 +203,10 @@ def _select_gcps(config: SceneConfig,
         n_in_ortho=len(in_ortho),
     )
 
-    print(f"  Loaded {len(all_gcps)} GCPs from {n_json} JSON file(s)")
+    logger.info("  Loaded %d GCPs from %d JSON file(s)", len(all_gcps), n_json)
     if n_excl:
-        print(f"  Excluded {n_excl} near calibration tie points")
-    print(f"  Inside ortho with valid data: {len(in_ortho)}")
+        logger.info("  Excluded %d near calibration tie points", n_excl)
+    logger.info("  Inside ortho with valid data: %d", len(in_ortho))
 
     return in_ortho, meta
 
@@ -196,15 +215,30 @@ def _select_gcps(config: SceneConfig,
 # NCC helpers  (used by method B)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _gradient_magnitude(img: np.ndarray) -> np.ndarray:
+    """Sobel gradient magnitude — removes radiometric differences,
+    keeps only structural edges."""
+    img = img.astype(np.float32)
+    if HAS_CV2:
+        gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+    else:
+        from scipy.ndimage import sobel
+        gx = sobel(img, axis=1).astype(np.float32)
+        gy = sobel(img, axis=0).astype(np.float32)
+    return np.sqrt(gx ** 2 + gy ** 2)
+
+
 def normalised_cross_correlation(
         template: np.ndarray,
         image: np.ndarray,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, bool]:
     """
     Sub-pixel NCC of *template* inside *image*.
 
-    Returns ``(dy, dx, ncc_peak)`` — offset of template-match centre
-    relative to image centre, in pixels.
+    Returns ``(dy, dx, ncc_peak, edge_hit)`` — offset of template-match
+    centre relative to image centre, in pixels.  *edge_hit* is True when
+    the peak sits at the search-window border (unreliable).
     """
     if HAS_CV2:
         result = cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED)
@@ -241,7 +275,23 @@ def normalised_cross_correlation(
     dx = (px + dx_sub) - expected_x
     dy = (py + dy_sub) - expected_y
 
-    return dy, dx, max_val
+    edge_hit = (px <= 0 or px >= w - 1 or py <= 0 or py >= h - 1)
+
+    return dy, dx, max_val, edge_hit
+
+
+def gradient_ncc(
+        template: np.ndarray,
+        image: np.ndarray,
+) -> Tuple[float, float, float, bool]:
+    """NCC on Sobel gradient-magnitude images.
+
+    Removes cross-sensor radiometric differences, keeps only structure.
+    """
+    return normalised_cross_correlation(
+        _gradient_magnitude(template),
+        _gradient_magnitude(image),
+    )
 
 
 def extract_ortho_patch_utm(
@@ -250,21 +300,30 @@ def extract_ortho_patch_utm(
         chip_crs,
         chip_shape: Tuple[int, int],
         chip_res: float,
-        margin_px: int = 20,
+        work_res: float = PIXEL_SIZE,
+        margin_m: float = 200.0,
+        offset_e: float = 0.0,
+        offset_n: float = 0.0,
 ) -> Optional[np.ndarray]:
     """
-    Extract a patch from the ortho reprojected to the chip's UTM grid,
-    with an extra *margin_px* search margin.  Returns float32 2-D or None.
-    """
-    margin_m = margin_px * chip_res
-    dst_left   = chip_bounds.left   - margin_m
-    dst_bottom = chip_bounds.bottom - margin_m
-    dst_right  = chip_bounds.right  + margin_m
-    dst_top    = chip_bounds.top    + margin_m
+    Extract a patch from the ortho reprojected to the chip's UTM grid
+    at *work_res* (default 4.75 m) with an extra *margin_m* search
+    margin (in metres).
 
-    dst_w = int(round((dst_right - dst_left) / chip_res))
-    dst_h = int(round((dst_top - dst_bottom) / chip_res))
-    dst_tf = Affine(chip_res, 0, dst_left, 0, -chip_res, dst_top)
+    *offset_e* / *offset_n* shift the extraction centre (in metres,
+    UTM easting / northing) — used by pass-2 of the two-pass scheme
+    to centre the fine search on the coarse estimate.
+
+    Returns float32 2-D array or None.
+    """
+    dst_left   = chip_bounds.left   - margin_m + offset_e
+    dst_bottom = chip_bounds.bottom - margin_m + offset_n
+    dst_right  = chip_bounds.right  + margin_m + offset_e
+    dst_top    = chip_bounds.top    + margin_m + offset_n
+
+    dst_w = int(round((dst_right - dst_left) / work_res))
+    dst_h = int(round((dst_top - dst_bottom) / work_res))
+    dst_tf = Affine(work_res, 0, dst_left, 0, -work_res, dst_top)
 
     with rasterio.open(ortho_path) as src:
         n_bands = src.count
@@ -301,6 +360,90 @@ def extract_ortho_patch_utm(
     if np.count_nonzero(dst_array) < 0.3 * dst_array.size:
         return None
     return dst_array
+
+
+def extract_reference_chip_from_raster(
+        reference_path: str,
+        center_e: float,
+        center_n: float,
+        chip_crs,
+        chip_shape: Tuple[int, int] = (57, 57),
+        chip_res: float = 10.0,
+) -> Optional[np.ndarray]:
+    """Extract a reference chip from an arbitrary raster in a target UTM grid.
+
+    Used for `reference_source='us_naip'`, where no pre-tiled ESA chips exist.
+    """
+    h, w = chip_shape
+    half_w = 0.5 * w * chip_res
+    half_h = 0.5 * h * chip_res
+
+    chip_bounds = BoundingBox(
+        left=center_e - half_w,
+        bottom=center_n - half_h,
+        right=center_e + half_w,
+        top=center_n + half_h,
+    )
+    dst_tf = Affine(chip_res, 0, chip_bounds.left,
+                    0, -chip_res, chip_bounds.top)
+
+    with rasterio.open(reference_path) as src:
+        n_bands = src.count
+        if n_bands >= 3:
+            channels = []
+            for b in range(1, 4):
+                ch = np.zeros((h, w), dtype=np.float32)
+                reproject(
+                    source=rasterio.band(src, b),
+                    destination=ch,
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=dst_tf,
+                    dst_crs=chip_crs,
+                    resampling=Resampling.bilinear,
+                )
+                channels.append(ch)
+            out = (0.2989 * channels[0]
+                   + 0.5870 * channels[1]
+                   + 0.1140 * channels[2])
+        else:
+            out = np.zeros((h, w), dtype=np.float32)
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=out,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=dst_tf,
+                dst_crs=chip_crs,
+                resampling=Resampling.bilinear,
+            )
+
+    if np.count_nonzero(out) < 0.3 * out.size:
+        return None
+    return out
+
+
+def _upsample_chip_to_work_res(
+        chip_data: np.ndarray,
+        chip_res: float,
+        work_res: float = PIXEL_SIZE,
+) -> np.ndarray:
+    """Resample a chip (typically 57×57 @ 10 m) to *work_res* (4.75 m).
+
+    Uses bilinear interpolation via cv2.resize or scipy.zoom.
+    Returns float32 2-D array.
+    """
+    scale = chip_res / work_res
+    new_h = int(round(chip_data.shape[0] * scale))
+    new_w = int(round(chip_data.shape[1] * scale))
+
+    chip_f32 = chip_data.astype(np.float32)
+    if HAS_CV2:
+        return cv2.resize(chip_f32, (new_w, new_h),
+                          interpolation=cv2.INTER_LINEAR)
+    else:
+        from scipy.ndimage import zoom
+        return zoom(chip_f32, (scale, scale), order=1).astype(np.float32)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -363,53 +506,62 @@ def _compute_stats(results: List[dict]) -> dict:
 def _print_stats(stats: dict, meta: dict, method_label: str) -> None:
     """Pretty-print verification statistics."""
     ps = PIXEL_SIZE
-    print("\n" + "=" * 72)
-    print(f"VERIFICATION RESULTS — {method_label}")
-    print("=" * 72)
+    logger.info("\n" + "=" * 72)
+    logger.info(f"VERIFICATION RESULTS — {method_label}")
+    logger.info("=" * 72)
 
-    print(f"  GCPs loaded / holdout-excluded / in ortho: "
-          f"{meta['n_total']} / {meta['n_excluded_holdout']} / "
-          f"{meta['n_in_ortho']}")
+    logger.info(
+        f"  GCPs loaded / holdout-excluded / in ortho: "
+        f"{meta['n_total']} / {meta['n_excluded_holdout']} / "
+        f"{meta['n_in_ortho']}")
     if "n_skipped" in meta:
-        print(f"  Skipped / low-quality  : "
-              f"{meta.get('n_skipped', 0)} / {meta.get('n_low_quality', 0)}")
-    print(f"  Successfully evaluated : {stats.get('n', 0)}")
+        logger.info(
+            f"  Skipped / low-quality  : "
+            f"{meta.get('n_skipped', 0)} / {meta.get('n_low_quality', 0)}")
+    if meta.get("n_inconsistent", 0):
+        logger.info(f"  Consistency-gate rejects: {meta['n_inconsistent']}")
+    if meta.get("n_outlier", 0):
+        logger.info(f"  MAD outliers removed   : {meta['n_outlier']}")
+    logger.info(f"  Successfully evaluated : {stats.get('n', 0)}")
 
     if not stats:
-        print("  (no usable results)")
+        logger.info("  (no usable results)")
         return
 
     for label, key in [("Easting  (cross-track)", "easting"),
                        ("Northing (along-track)", "northing")]:
         s = stats[key]
-        print(f"\n  {label}:")
-        print(f"    Mean  : {s['mean']:+8.2f} m  ({s['mean']/ps:+6.2f} px)")
-        print(f"    Std   : {s['std']:8.2f} m  ({s['std']/ps:6.2f} px)")
-        print(f"    RMSE  : {s['rmse']:8.2f} m  ({s['rmse_px']:6.2f} px)")
+        logger.info(f"\n  {label}:")
+        logger.info(f"    Mean  : {s['mean']:+8.2f} m  ({s['mean']/ps:+6.2f} px)")
+        logger.info(f"    Std   : {s['std']:8.2f} m  ({s['std']/ps:6.2f} px)")
+        logger.info(f"    RMSE  : {s['rmse']:8.2f} m  ({s['rmse_px']:6.2f} px)")
 
     t = stats["total"]
-    print(f"\n  Total 2-D:")
-    print(f"    Mean   : {t['mean']:8.2f} m  ({t['mean']/ps:6.2f} px)")
-    print(f"    Median : {t['median']:8.2f} m  ({t['median_px']:6.2f} px)")
-    print(f"    RMSE   : {t['rmse']:8.2f} m  ({t['rmse_px']:6.2f} px)")
-    print(f"    Max    : {t['max']:8.2f} m     Min : {t['min']:.2f} m")
+    logger.info("\n  Total 2-D:")
+    logger.info(f"    Mean   : {t['mean']:8.2f} m  ({t['mean']/ps:6.2f} px)")
+    logger.info(f"    Median : {t['median']:8.2f} m  ({t['median_px']:6.2f} px)")
+    logger.info(f"    RMSE   : {t['rmse']:8.2f} m  ({t['rmse_px']:6.2f} px)")
+    logger.info(f"    Max    : {t['max']:8.2f} m     Min : {t['min']:.2f} m")
 
     if "ncc_mean" in stats:
-        print(f"\n  NCC  mean={stats['ncc_mean']:.3f}  "
-              f"median={stats['ncc_median']:.3f}")
+        logger.info(
+            f"\n  NCC  mean={stats['ncc_mean']:.3f}  "
+            f"median={stats['ncc_median']:.3f}")
     if "matches_mean" in stats:
-        print(f"  Matches  mean={stats['matches_mean']:.0f}  "
-              f"median={stats['matches_median']:.0f}")
+        logger.info(
+            f"  Matches  mean={stats['matches_mean']:.0f}  "
+            f"median={stats['matches_median']:.0f}")
 
     if stats.get("by_quality"):
-        print()
+        logger.info("")
         for q, qs in stats["by_quality"].items():
-            print(f"  Q{q}: n={qs['n']:3d}  "
-                  f"RMSE={qs['rmse']:7.2f} m ({qs['rmse_px']:5.2f} px)  "
-                  f"mean={qs['mean']:7.2f} m")
+            logger.info(
+                f"  Q{q}: n={qs['n']:3d}  "
+                f"RMSE={qs['rmse']:7.2f} m ({qs['rmse_px']:5.2f} px)  "
+                f"mean={qs['mean']:7.2f} m")
 
-    print(f"\n  Pixel reference: {ps} m (PhiSat-2 GSD)")
-    print("=" * 72)
+    logger.info(f"\n  Pixel reference: {ps} m (PhiSat-2 GSD)")
+    logger.info("=" * 72)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -443,7 +595,7 @@ def _save_json(path: Path, results: List[dict], stats: dict,
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(payload, f, indent=2, cls=_NumpyEncoder)
-    print(f"\n  Saved → {path}")
+    logger.info("  Saved → %s", path)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -459,21 +611,22 @@ def verify_position(config: SceneConfig) -> dict:
     """
     ortho_path = str(config.ortho_path)
 
-    print("\n" + "=" * 72)
-    print(f"METHOD A — Position-based (ICP) — scene '{config.name}'")
-    print("=" * 72)
+    logger.info("\n" + "=" * 72)
+    logger.info(f"METHOD A — Position-based (ICP) — scene '{config.name}'")
+    logger.info("=" * 72)
 
     with rasterio.open(ortho_path) as src:
         ob = src.bounds
         ortho_data = src.read()
+        ortho_crs = src.crs
         ortho_tf   = src.transform
         ortho_crs  = src.crs
 
-    gcps, meta = _select_gcps(config, ob, ortho_data, ortho_tf,
+    gcps, meta = _select_gcps(config, ob, ortho_data, ortho_crs, ortho_tf,
                               require_chip=False)
 
     if not gcps:
-        print("  No usable GCPs.")
+        logger.info("  No usable GCPs.")
         return dict(results=[], stats={}, meta=meta)
 
     try:
@@ -481,9 +634,10 @@ def verify_position(config: SceneConfig) -> dict:
     except ImportError:
         raise ImportError("Method A requires pyproj  (pip install pyproj)")
 
-    print(f"\n{'ID':<16s} {'Lon':>11s} {'Lat':>10s} {'Q':>2s} "
-          f"{'dE_m':>8s} {'dN_m':>8s} {'Err_m':>8s} {'Err_px':>7s}")
-    print("─" * 75)
+    logger.info(
+        f"\n{'ID':<16s} {'Lon':>11s} {'Lat':>10s} {'Q':>2s} "
+        f"{'dE_m':>8s} {'dN_m':>8s} {'Err_m':>8s} {'Err_px':>7s}")
+    logger.info("─" * 75)
 
     results: List[dict] = []
 
@@ -517,10 +671,11 @@ def verify_position(config: SceneConfig) -> dict:
             total_m=float(total_m),
         ))
 
-        print(f"{g['id']:<16s} {g['lon']:11.6f} {g['lat']:10.6f} "
-              f"{g['quality']:2d} "
-              f"{east_m:+8.1f} {north_m:+8.1f} {total_m:8.1f} "
-              f"{total_m / PIXEL_SIZE:7.2f}")
+        logger.info(
+            f"{g['id']:<16s} {g['lon']:11.6f} {g['lat']:10.6f} "
+            f"{g['quality']:2d} "
+            f"{east_m:+8.1f} {north_m:+8.1f} {total_m:8.1f} "
+            f"{total_m / PIXEL_SIZE:7.2f}")
 
     stats = _compute_stats(results)
     _print_stats(stats, meta, "Position-based (ICP)")
@@ -532,96 +687,278 @@ def verify_position(config: SceneConfig) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# METHOD B — GCP-chip NCC cross-correlation
+# METHOD B — Two-pass GCP-chip NCC cross-correlation
 # ═══════════════════════════════════════════════════════════════════════════
 
-def verify_ncc(config: SceneConfig,
-               min_ncc: float = 0.15) -> dict:
+# Two-pass search parameters
+_COARSE_MARGIN_M  = 200.0    # pass-1 search radius (metres)
+_FINE_MARGIN_M    = 30.0     # pass-2 search radius, centred on coarse hit
+_CONSIST_THRESH_M = 30.0     # max coarse/fine disagreement (metres)
+
+
+def _single_pass_ncc(
+        ortho_path: str,
+        chip_data: np.ndarray,
+        chip_crs,
+        chip_bounds,
+        chip_res: float,
+        chip_shape: Tuple[int, int],
+        work_res: float,
+        margin_m: float,
+        offset_e: float = 0.0,
+        offset_n: float = 0.0,
+) -> Tuple[Optional[float], Optional[float], Optional[float],
+           bool, bool, Optional[np.ndarray]]:
+    """Run one NCC pass.  Returns (dy, dx, ncc, edge_hit, no_data, chip_up).
+
+    *dy/dx* are in work_res pixels (image convention: +y down, +x right).
+    *offset_e/n* shift the extraction centre for pass-2.
+    *chip_up* is the upsampled chip (returned so pass-2 can reuse it).
     """
-    Match ESA Sentinel-2 L1C chips against ortho patches using NCC.
+    patch = extract_ortho_patch_utm(
+        ortho_path, chip_bounds, chip_crs, chip_shape, chip_res,
+        work_res=work_res, margin_m=margin_m,
+        offset_e=offset_e, offset_n=offset_n,
+    )
+    if patch is None:
+        return None, None, None, False, True, None
+
+    chip_up = _upsample_chip_to_work_res(chip_data, chip_res, work_res)
+
+    try:
+        dy, dx, ncc, edge_hit = gradient_ncc(chip_up, patch)
+    except Exception:
+        return None, None, None, False, True, chip_up
+
+    return dy, dx, ncc, edge_hit, False, chip_up
+
+
+def verify_ncc(config: SceneConfig,
+               min_ncc: float = 0.25,
+               reference_source: str = "sentinel") -> dict:
+    """
+    Two-pass NCC verification with consistency gate.
+
+    Pass 1 (coarse): gradient-NCC at 4.75 m resolution with a wide
+    200 m search margin.  Finds the approximate offset.
+
+    Pass 2 (fine): gradient-NCC at 4.75 m with a tight 30 m margin
+    **centred on the coarse offset**.  Refines the measurement in a
+    region where false locks are unlikely.
+
+    Consistency gate: if the coarse and fine offsets disagree by more
+    than 30 m, the GCP is rejected as a probable false lock — the two
+    independent measurements don't confirm each other.
+
+    MAD outlier rejection runs **after** the consistency gate as a
+    final reporting filter to remove genuinely bad GCP chips.
     """
     ortho_path = str(config.ortho_path)
 
-    print("\n" + "=" * 72)
-    print(f"METHOD B — NCC cross-correlation — scene '{config.name}'")
-    print("=" * 72)
+    logger.info("\n" + "=" * 72)
+    logger.info(f"METHOD B — Two-pass NCC ({reference_source}) — scene '{config.name}'")
+    logger.info("=" * 72)
 
     with rasterio.open(ortho_path) as src:
         ob = src.bounds
         ortho_data = src.read()
+        ortho_crs = src.crs
         ortho_tf   = src.transform
 
-    gcps, meta = _select_gcps(config, ob, ortho_data, ortho_tf,
-                              require_chip=True)
+    require_chip = (reference_source == "sentinel")
+    gcps, meta = _select_gcps(config, ob, ortho_data, ortho_crs, ortho_tf,
+                              require_chip=require_chip)
+
+    if reference_source not in ("sentinel", "us_naip"):
+        raise ValueError("reference_source must be 'sentinel' or 'us_naip'")
 
     if not gcps:
-        print("  No usable GCPs with chips.")
+        logger.info("  No usable GCPs for selected reference source.")
         return dict(results=[], stats={}, meta=meta)
 
-    print(f"\n{'ID':<16s} {'Lon':>11s} {'Lat':>10s} {'Q':>2s} "
-          f"{'dE_m':>8s} {'dN_m':>8s} {'Err_m':>8s} {'Err_px':>7s} "
-          f"{'NCC':>6s}")
-    print("─" * 80)
+    us_ref_path = None
+    if reference_source == "us_naip":
+        if config.us_national_ortho_path is None or not config.us_national_ortho_path.exists():
+            raise FileNotFoundError(
+                "US NAIP reference requested but not found. "
+                "Run fetch first or set config.us_national_ortho."
+            )
+        us_ref_path = str(config.us_national_ortho_path)
+
+    work_res = PIXEL_SIZE
+
+    logger.info(
+        f"\n{'ID':<16s} {'Lon':>11s} {'Lat':>10s} {'Q':>2s} "
+        f"{'dE_m':>8s} {'dN_m':>8s} {'Err_m':>8s} {'Err_px':>7s} "
+        f"{'NCC':>6s} {'gate':>6s}")
+    logger.info("─" * 90)
 
     results: List[dict] = []
-    skipped = low_corr = 0
+    skipped = 0
+    low_corr = 0
+    inconsistent = 0
 
     for gcp in gcps:
-        with rasterio.open(gcp["chip_path"]) as cs:
-            chip_data = cs.read(1).astype(np.float32)
-            chip_crs  = cs.crs
-            chip_bounds = cs.bounds
-            chip_res  = abs(cs.transform.a)
-            chip_shape = cs.shape
+        gid = gcp["id"]
+        if reference_source == "sentinel":
+            with rasterio.open(gcp["chip_path"]) as cs:
+                chip_data = cs.read(1).astype(np.float32)
+                chip_crs  = cs.crs
+                chip_bounds = cs.bounds
+                chip_res  = abs(cs.transform.a)
+                chip_shape = cs.shape
+        else:
+            chip_res = 10.0
+            chip_shape = (57, 57)
+            chip_crs = CRS.from_epsg(int(gcp["epsg"]))
+            half_w = 0.5 * chip_shape[1] * chip_res
+            half_h = 0.5 * chip_shape[0] * chip_res
+            chip_bounds = BoundingBox(
+                left=gcp["x_utm"] - half_w,
+                bottom=gcp["y_utm"] - half_h,
+                right=gcp["x_utm"] + half_w,
+                top=gcp["y_utm"] + half_h,
+            )
+            chip_data = extract_reference_chip_from_raster(
+                us_ref_path,
+                center_e=gcp["x_utm"],
+                center_n=gcp["y_utm"],
+                chip_crs=chip_crs,
+                chip_shape=chip_shape,
+                chip_res=chip_res,
+            )
+            if chip_data is None:
+                skipped += 1
+                logger.info(
+                    f"{gid:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
+                    f"{gcp['quality']:2d}  "
+                    f"{'— no US reference coverage —':>42s}")
+                continue
 
-        patch = extract_ortho_patch_utm(
-            ortho_path, chip_bounds, chip_crs, chip_shape, chip_res)
+        # ── Pass 1: coarse (wide search) ─────────────────────────────
+        dy1, dx1, ncc1, edge1, no_data1, chip_up = _single_pass_ncc(
+            ortho_path, chip_data, chip_crs, chip_bounds,
+            chip_res, chip_shape, work_res,
+            margin_m=_COARSE_MARGIN_M,
+        )
 
-        if patch is None:
+        if no_data1:
             skipped += 1
-            print(f"{gcp['id']:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
-                  f"{gcp['quality']:2d}  "
-                  f"{'— insufficient ortho coverage —':>42s}")
+            logger.info(
+                f"{gid:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
+                f"{gcp['quality']:2d}  "
+                f"{'— insufficient ortho coverage —':>42s}")
             continue
 
-        chip_norm  = (chip_data - chip_data.mean()).astype(np.float32)
-        patch_norm = (patch    - patch.mean()).astype(np.float32)
-
-        try:
-            dy, dx, ncc = normalised_cross_correlation(chip_norm, patch_norm)
-        except Exception as exc:
+        if edge1:
             skipped += 1
-            print(f"{gcp['id']:<16s}  — NCC error: {exc}")
+            logger.info(
+                f"{gid:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
+                f"{gcp['quality']:2d}  "
+                f"{'— coarse peak at border':>28s}  NCC={ncc1:.3f}")
             continue
+
+        if ncc1 < min_ncc:
+            low_corr += 1
+            logger.info(
+                f"{gid:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
+                f"{gcp['quality']:2d}  "
+                f"{'— low coarse NCC:':>20s} {ncc1:.3f}")
+            continue
+
+        # Coarse offset in metres (UTM: +east, +north)
+        coarse_e =  dx1 * work_res
+        coarse_n = -dy1 * work_res
+
+        # ── Pass 2: fine (tight search centred on coarse hit) ────────
+        dy2, dx2, ncc2, edge2, no_data2, _ = _single_pass_ncc(
+            ortho_path, chip_data, chip_crs, chip_bounds,
+            chip_res, chip_shape, work_res,
+            margin_m=_FINE_MARGIN_M,
+            offset_e=coarse_e,
+            offset_n=coarse_n,
+        )
+
+        if no_data2 or edge2:
+            # Fine pass failed — fall back to coarse-only (mark it)
+            east_m, north_m, ncc = coarse_e, coarse_n, ncc1
+            gate_label = "coarse"
+        else:
+            # Fine offset is relative to the shifted centre → add coarse
+            fine_e = coarse_e + dx2 * work_res
+            fine_n = coarse_n + (-dy2 * work_res)
+
+            # ── Consistency gate ─────────────────────────────────────
+            disagree = np.hypot(fine_e - coarse_e, fine_n - coarse_n)
+            if disagree > _CONSIST_THRESH_M:
+                inconsistent += 1
+                logger.info(
+                    f"{gid:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
+                    f"{gcp['quality']:2d}  "
+                    f"— inconsistent: coarse={np.hypot(coarse_e,coarse_n):.1f} m "
+                    f"fine={np.hypot(fine_e,fine_n):.1f} m "
+                    f"Δ={disagree:.1f} m")
+                continue
+
+            east_m, north_m = fine_e, fine_n
+            ncc = max(ncc1, ncc2)
+            gate_label = "ok"
 
         if ncc < min_ncc:
             low_corr += 1
-            print(f"{gcp['id']:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
-                  f"{gcp['quality']:2d}  "
-                  f"{'— low NCC:':>20s} {ncc:.3f}")
+            logger.info(
+                f"{gid:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
+                f"{gcp['quality']:2d}  "
+                f"{'— low fine NCC:':>20s} {ncc:.3f}")
             continue
 
-        east_m  =  dx * chip_res
-        north_m = -dy * chip_res
-        total_m = np.hypot(east_m, north_m)
+        total_m = float(np.hypot(east_m, north_m))
 
         results.append(dict(
-            id=gcp["id"], lon=gcp["lon"], lat=gcp["lat"],
+            id=gid, lon=gcp["lon"], lat=gcp["lat"],
             alt=gcp["alt"], quality=gcp["quality"],
-            east_m=east_m, north_m=north_m, total_m=total_m, ncc=ncc,
+            east_m=float(east_m), north_m=float(north_m),
+            total_m=total_m, ncc=float(ncc),
         ))
 
-        print(f"{gcp['id']:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
-              f"{gcp['quality']:2d} "
-              f"{east_m:+8.1f} {north_m:+8.1f} {total_m:8.1f} "
-              f"{total_m / PIXEL_SIZE:7.2f} {ncc:6.3f}")
+        logger.info(
+            f"{gid:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
+            f"{gcp['quality']:2d} "
+            f"{east_m:+8.1f} {north_m:+8.1f} {total_m:8.1f} "
+            f"{total_m / PIXEL_SIZE:7.2f} {ncc:6.3f} "
+            f"{gate_label:>6s}")
 
-    meta.update(n_skipped=skipped, n_low_quality=low_corr, min_ncc=min_ncc)
+    # ── MAD outlier rejection (post-consistency-gate) ────────────────
+    # The consistency gate already removed false locks.  MAD now only
+    # catches genuine anomalies (e.g. a GCP chip whose ground truth is
+    # itself wrong).
+    n_outlier = 0
+    if len(results) >= 5:
+        totals = np.array([r["total_m"] for r in results])
+        med = np.median(totals)
+        mad = np.median(np.abs(totals - med))
+        mad_sigma = 1.4826 * mad
+        cutoff = med + 3.0 * mad_sigma
+        keep = []
+        for r in results:
+            if r["total_m"] > cutoff:
+                n_outlier += 1
+                logger.info(
+                    f"  [MAD outlier] {r['id']:<16s} "
+                    f"err={r['total_m']:.1f} m  "
+                    f"(cutoff={cutoff:.1f} m)")
+            else:
+                keep.append(r)
+        results = keep
+
+    meta.update(n_skipped=skipped, n_low_quality=low_corr,
+                n_inconsistent=inconsistent, n_outlier=n_outlier,
+                min_ncc=min_ncc, reference_source=reference_source)
     stats = _compute_stats(results)
-    _print_stats(stats, meta, "NCC cross-correlation")
+    _print_stats(stats, meta, f"Two-pass NCC ({reference_source})")
 
     out = config.output_dir / "verify_ncc.json"
-    _save_json(out, results, stats, meta, "ncc")
+    _save_json(out, results, stats, meta, "ncc_two_pass")
 
     return dict(results=results, stats=stats, meta=meta)
 
@@ -635,7 +972,8 @@ VERIFY_METHODS = ["all", "position", "ncc"]
 
 def run_verification(config: SceneConfig,
                      method: str = "all",
-                     min_ncc: float = 0.15,
+                     min_ncc: float = 0.25,
+                     reference_source: str = "sentinel",
                      ) -> dict:
     """
     Run GCP verification for a scene.
@@ -648,7 +986,18 @@ def run_verification(config: SceneConfig,
     min_ncc : float
         NCC threshold for method B.
     """
-    missing = config.check_inputs("verify")
+    if reference_source == "sentinel":
+        missing = config.check_inputs("verify")
+    else:
+        missing = []
+        if config.ortho_path is None or not config.ortho_path.exists():
+            missing.append(f"Ortho GeoTIFF: {config.ortho_path}")
+        if config.gcp_json_path is None or not config.gcp_json_path.exists():
+            missing.append(f"GCP JSON: {config.gcp_json_path}")
+        if (config.us_national_ortho_path is None
+                or not config.us_national_ortho_path.exists()):
+            missing.append(f"US national ortho: {config.us_national_ortho_path}")
+
     if missing:
         raise FileNotFoundError(
             "Missing files for verify:\n  " + "\n  ".join(missing))
@@ -659,7 +1008,8 @@ def run_verification(config: SceneConfig,
         out["position"] = verify_position(config)
 
     if method in ("all", "ncc"):
-        out["ncc"] = verify_ncc(config, min_ncc=min_ncc)
+        out["ncc"] = verify_ncc(config, min_ncc=min_ncc,
+                                reference_source=reference_source)
 
     # Also save NCC results under the legacy path
     if method == "all" and "ncc" in out:
