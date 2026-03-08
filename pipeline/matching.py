@@ -7,6 +7,7 @@ and geo-coordinate extraction from the matched keypoints.
 """
 
 import csv
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -25,6 +26,8 @@ from .utils import (
     save_tie_points,
 )
 
+logger = logging.getLogger(__name__)
+
 
 # ── Sentinel reprojection ──────────────────────────────────────────────
 
@@ -37,8 +40,9 @@ def reproject_sentinel_to_phisat(
     Reproject Sentinel-2 RGB onto the PhiSat-2 pixel grid (+ margin).
     Returns (reprojected_rgb [H, W, 3], transform).
     """
-    print(f"\nReprojecting Sentinel-2 to PhiSat grid "
-          f"(+{margin_pixels} px margin)…")
+    logger.info(
+        "Reprojecting Sentinel-2 to PhiSat grid (+%d px margin)...",
+        margin_pixels)
 
     src_transform = phisat_ds.transform
     src_crs = phisat_ds.crs
@@ -50,7 +54,7 @@ def reproject_sentinel_to_phisat(
                      * rasterio.Affine.translation(-margin_pixels,
                                                    -margin_pixels))
 
-    print(f"  Target grid: {new_w}×{new_h}")
+    logger.info("  Target grid: %d×%d", new_w, new_h)
 
     dest = np.zeros((3, new_h, new_w), dtype=np.uint8)
     bands = [1, 2, 3] if sentinel_ds.count >= 3 else [1]
@@ -105,7 +109,7 @@ class MatchVisualizer:
 
         total = len(keypoints0)
         if total == 0:
-            print("  No matches to visualise.")
+            logger.info("  No matches to visualise.")
             return
 
         if total > max_matches:
@@ -152,7 +156,7 @@ class MatchVisualizer:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
-        print(f"  Saved match visualisation → {output_path}")
+        logger.info("  Saved match visualisation → %s", output_path)
 
 
 # ── Full matching pipeline ─────────────────────────────────────────────
@@ -182,9 +186,9 @@ def run_matching(config: SceneConfig,
         raise FileNotFoundError(
             "Missing files for matching:\n  " + "\n  ".join(missing))
 
-    print("=" * 60)
-    print(f"MATCHING — scene '{config.name}'  matcher={matcher_name}")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("MATCHING — scene '%s'  matcher=%s", config.name, matcher_name)
+    logger.info("=" * 60)
 
     # 1. Load images
     phisat_img, phisat_ds = load_satellite_image(str(config.phisat_image_path))
@@ -202,7 +206,7 @@ def run_matching(config: SceneConfig,
         sentinel_ds, phisat_ds, margin_pixels=config.margin_pixels)
 
     # 3. Enhance
-    print("Enhancing images…")
+    logger.info("Enhancing images...")
     phi_enh = enhance_for_matching(phisat_img)
     sen_enh = enhance_for_matching(sentinel_aligned)
 
@@ -211,7 +215,7 @@ def run_matching(config: SceneConfig,
                 cv2.cvtColor(phi_enh, cv2.COLOR_RGB2BGR))
     cv2.imwrite(str(config.debug_sentinel_path),
                 cv2.cvtColor(sen_enh, cv2.COLOR_RGB2BGR))
-    print(f"  Debug images → {config.output_dir}")
+    logger.info("  Debug images → %s", config.output_dir)
 
     # 4. Match
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -219,14 +223,14 @@ def run_matching(config: SceneConfig,
                           max_keypoints=config.max_keypoints)
     result = matcher.match(phi_enh, sen_enh)
     kp0, kp1 = result["keypoints0"], result["keypoints1"]
-    print(f"Raw matches: {len(kp0)}")
+    logger.info("Raw matches: %d", len(kp0))
 
     # 5. RANSAC
     kp0, kp1 = ransac_filter(kp0, kp1)
-    print(f"After RANSAC: {len(kp0)}")
+    logger.info("After RANSAC: %d", len(kp0))
 
     if len(kp0) == 0:
-        print("No matches found!")
+        logger.warning("No matches found!")
         phisat_ds.close()
         sentinel_ds.close()
         return []
@@ -249,7 +253,7 @@ def run_matching(config: SceneConfig,
     # 8. Save
     if config.tie_points_csv:
         save_tie_points(tie_points, str(config.tie_points_path))
-        print(f"Saved {len(tie_points)} tie points → {config.tie_points_path}")
+        logger.info("Saved %d tie points → %s", len(tie_points), config.tie_points_path)
 
     phisat_ds.close()
     sentinel_ds.close()
