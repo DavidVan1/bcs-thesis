@@ -4,12 +4,15 @@ Shared utilities: image I/O, enhancement, tie-point loading.
 
 import csv
 import json
+import logging
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import cv2
 import rasterio
+
+logger = logging.getLogger(__name__)
 
 
 # ── Tie-point I/O ───────────────────────────────────────────────────────
@@ -78,6 +81,9 @@ def load_calibration(json_path: str) -> Dict:
         "yaw": pose.get("yaw", 0.0),
         "time_shift": pose.get("time_shift", 0.0),
         "along_rate": pose.get("along_rate", 0.0),
+        "roll_rate":  pose.get("roll_rate",  0.0),
+        "pitch_rate": pose.get("pitch_rate", 0.0),
+        "yaw_rate":   pose.get("yaw_rate",   0.0),
     }
 
 
@@ -102,6 +108,9 @@ def save_calibration(calib: Dict, json_path: str,
             "pitch": calib.get("pitch", 0.0),
             "yaw": calib.get("yaw", 0.0),
             "along_rate": calib.get("along_rate", 0.0),
+            "roll_rate":  calib.get("roll_rate",  0.0),
+            "pitch_rate": calib.get("pitch_rate", 0.0),
+            "yaw_rate":   calib.get("yaw_rate",   0.0),
         },
     }
     if stats:
@@ -237,5 +246,5 @@ def load_metadata_timing(metadata_path: str) -> Optional[Dict]:
             "session_key": session_key,
         }
     except (KeyError, IndexError, TypeError) as e:
-        print(f"  Warning: metadata parsing failed ({e})")
+        logger.warning("Metadata parsing failed: %s", e)
         return None
