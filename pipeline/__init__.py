@@ -19,7 +19,16 @@ Modules:
 """
 
 from .config import SceneConfig, get_scene_config, list_scenes
-from .matchers import get_matcher, list_matchers
+
+
+def get_matcher(*args, **kwargs):
+    from .matchers import get_matcher as _get_matcher
+    return _get_matcher(*args, **kwargs)
+
+
+def list_matchers():
+    from .matchers import list_matchers as _list_matchers
+    return _list_matchers()
 
 __all__ = [
     "SceneConfig",
