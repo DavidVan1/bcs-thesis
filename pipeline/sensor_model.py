@@ -14,11 +14,14 @@ Supports:
 """
 
 import json
+import logging
 import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple
 
 from scipy.spatial.transform import Rotation as SciRot
+
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -87,9 +90,9 @@ class PhiSatPushbroomModel:
         self.quaternion = np.array(acq["QPointing"])   # [w, x, y, z]
         self.t0 = acq["ADCSTimeSec"] + acq["ADCSTimeNs"] * 1e-9
 
-        print(f"Loaded AOCS metadata:")
-        print(f"  Position: {self.position}")
-        print(f"  Velocity: {self.velocity}")
+        logger.info("Loaded AOCS metadata:")
+        logger.info("  Position: %s", self.position)
+        logger.info("  Velocity: %s", self.velocity)
 
     # ── Intrinsics ──────────────────────────────────────────────────
 
@@ -144,7 +147,10 @@ class PhiSatPushbroomModel:
         y = 0.0  # pushbroom: along-track angle is zero
         xd, yd = self.apply_radial_distortion(x, y)
 
-        ray_cam = np.array([yd, xd, 1.0])
+        # Body-frame convention used by orthorectify/calibration:
+        # X = along-track, Y = cross-track, Z = boresight
+        # Pushbroom has no instantaneous along-track angle -> X=0.
+        ray_cam = np.array([0.0, xd, 1.0])
         ray_cam /= np.linalg.norm(ray_cam)
 
         t = self.scanline_to_time(py)
@@ -191,14 +197,30 @@ class RobustModel(PhiSatPushbroomModel):
     Pushbroom model with tuneable parameter vector used by the
     calibration optimizer.
 
-    Parameter vector (9):
+    Parameter vector (9 or 12):
         [time_shift, roll, pitch, yaw, f_scale, k1, k2, cx_rate, along_rate]
+        [roll_rate, pitch_rate, yaw_rate]   ← optional linear drift terms
 
     cx_rate models a linear cross-track drift: the effective principal
     point shifts as  cx_eff = cx + cx_rate · (py − cy).
 
     along_rate corrects a linear along-track ephemeris error by scaling
     the orbit propagation time:  sat_pos = pos + vel · dt · (1 + along_rate).
+
+    roll_rate / pitch_rate / yaw_rate model linear attitude drift during
+    acquisition.  The scanline position is normalised to [−0.5, 0.5] so
+    the rate parameters have the same unit (degrees) as the constant bias
+    terms and bounds can be applied symmetrically:
+
+        effective_roll(v)  = roll  + roll_rate  · norm_v
+        effective_pitch(v) = pitch + pitch_rate · norm_v
+        effective_yaw(v)   = yaw   + yaw_rate   · norm_v
+
+    where  norm_v = (v − cy) / image_height.
+
+    This single extra degree of freedom per axis is enough to absorb the
+    ~0.004° attitude drift that causes the observed north-to-south RMSE
+    gradient without over-fitting.
     """
 
     def predict_with_params(self, px: float, py: float,
@@ -207,10 +229,22 @@ class RobustModel(PhiSatPushbroomModel):
         t_shift, r, p, y = params[0], params[1], params[2], params[3]
         f_scale = params[4]
         k1, k2 = params[5], params[6]
-        cx_rate = params[7] if len(params) > 7 else 0.0
-        along_rate = params[8] if len(params) > 8 else 0.0
+        cx_rate    = params[7] if len(params) > 7  else 0.0
+        along_rate = params[8] if len(params) > 8  else 0.0
+        roll_rate  = params[9] if len(params) > 9  else 0.0
+        pitch_rate = params[10] if len(params) > 10 else 0.0
+        yaw_rate   = params[11] if len(params) > 11 else 0.0
 
         current_f = self.f * f_scale
+
+        # Normalised scanline position in [−0.5, 0.5]
+        # Uses image height derived from cy (principal point ≈ image centre)
+        norm_v = (py - self.cy) / (2.0 * self.cy) if self.cy > 0 else 0.0
+
+        # Linear attitude drift: effective angles vary with scanline
+        r_eff = r + roll_rate  * norm_v
+        p_eff = p + pitch_rate * norm_v
+        y_eff = y + yaw_rate   * norm_v
 
         # Cross-track drift: effective cx shifts linearly with scanline
         cx_eff = self.cx + cx_rate * (py - self.cy)
@@ -221,11 +255,12 @@ class RobustModel(PhiSatPushbroomModel):
         dist = 1.0 + k1 * r2 + k2 * r2 * r2
         xd, yd = x_norm * dist, y_norm * dist
 
-        ray_cam = np.array([yd, xd, 1.0])
+        # Keep identical axis convention as OrthorectificationEngine.
+        ray_cam = np.array([0.0, xd, 1.0])
         ray_cam /= np.linalg.norm(ray_cam)
 
-        # Mounting bias
-        rot = SciRot.from_euler("xyz", [r, p, y], degrees=True)
+        # Mounting bias + linear drift
+        rot = SciRot.from_euler("xyz", [r_eff, p_eff, y_eff], degrees=True)
         ray_body = rot.apply(ray_cam)
 
         t = self.scanline_to_time(py) + t_shift
@@ -291,7 +326,7 @@ def create_model(config, model_class=PhiSatPushbroomModel) -> PhiSatPushbroomMod
         timing = load_metadata_timing(str(config.metadata_path))
         if timing:
             model.line_time = timing["line_time"]
-            print(f"Updated line_time to {model.line_time:.6f} s")
+            logger.info("Updated line_time to %.6f s", model.line_time)
 
     # AOCS
     model.load_aocs_metadata(str(config.aocs_path))
@@ -304,6 +339,6 @@ def create_model(config, model_class=PhiSatPushbroomModel) -> PhiSatPushbroomMod
                      - model.t0
                      - (0 - model.cy) * model.line_time)
             model.along_shift = shift
-            print(f"Calculated along_shift: {shift:.3f} s")
+            logger.info("Calculated along_shift: %.3f s", shift)
 
     return model

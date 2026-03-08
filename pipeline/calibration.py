@@ -10,6 +10,7 @@ Parameter vector (9):
 """
 
 import json
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -19,6 +20,8 @@ from scipy.optimize import least_squares
 from .config import SceneConfig
 from .sensor_model import RobustModel, create_model
 from .utils import load_tie_points, save_calibration
+
+logger = logging.getLogger(__name__)
 
 
 # ── Residual function ──────────────────────────────────────────────────
@@ -68,24 +71,27 @@ def run_calibration(config: SceneConfig,
         raise FileNotFoundError(
             "Missing files for calibration:\n  " + "\n  ".join(missing))
 
-    print("=" * 60)
-    print(f"CALIBRATION — scene '{config.name}'")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info(f"CALIBRATION — scene '{config.name}'")
+    logger.info("=" * 60)
 
     # Model
     model = create_model(config, model_class=RobustModel)
 
     # Tie points
     all_points = load_tie_points(str(config.tie_points_path))
-    print(f"Loaded {len(all_points)} tie points.")
+    logger.info("Loaded %d tie points.", len(all_points))
 
-    # Bounds: [t_shift, roll, pitch, yaw, f_scale, k1, k2, cx_rate, along_rate]
-    x0 = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
-    lower = [-60.0, -5.0, -5.0, -5.0, 0.8, -1e-8, -1e-8, -1.0, -0.1]
-    upper = [ 60.0,  5.0,  5.0,  5.0, 1.2,  1e-8,  1e-8,  1.0,  0.1]
+    # Bounds: [t_shift, roll, pitch, yaw, f_scale, k1, k2, cx_rate, along_rate,
+    #          roll_rate, pitch_rate, yaw_rate]
+    x0    = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,  0.0,  0.0,  0.0]
+    lower = [-60., -5., -5., -5., 0.8, -1e-8, -1e-8,
+             -0.25, -0.03, -0.8, -0.8, -0.8]
+    upper = [ 60.,  5.,  5.,  5., 1.2,  1e-8,  1e-8,
+              0.25,  0.03,  0.8,  0.8,  0.8]
 
     # ── Phase 1: Robust (Soft L1) ──
-    print("\n--- Phase 1: Robust Optimisation (Soft L1) ---")
+    logger.info("\n--- Phase 1: Robust Optimisation (Soft L1) ---")
     res1 = least_squares(
         _residuals, x0, args=(model, all_points),
         bounds=(lower, upper),
@@ -94,7 +100,7 @@ def run_calibration(config: SceneConfig,
     )
 
     # ── Phase 2: 3-σ outlier removal ──
-    print("\n--- Phase 2: Outlier Filtering (3-σ) ---")
+    logger.info("\n--- Phase 2: Outlier Filtering (3-σ) ---")
     res_vec = _residuals(res1.x, model, all_points).reshape(-1, 2)
     distances = np.linalg.norm(res_vec, axis=1)
 
@@ -102,15 +108,16 @@ def run_calibration(config: SceneConfig,
     std_err = np.std(distances)
     threshold = mean_err + 3 * std_err
 
-    print(f"Mean: {mean_err:.1f} m  Std: {std_err:.1f} m  "
-          f"Threshold: {threshold:.1f} m")
+    logger.info(
+        "Mean: %.1f m  Std: %.1f m  Threshold: %.1f m",
+        mean_err, std_err, threshold)
 
     inliers = [tp for tp, d in zip(all_points, distances) if d < threshold]
     n_out = len(all_points) - len(inliers)
-    print(f"Kept {len(inliers)} inliers.  Removed {n_out} outliers.")
+    logger.info("Kept %d inliers.  Removed %d outliers.", len(inliers), n_out)
 
     # ── Phase 3: Final refinement ──
-    print("\n--- Phase 3: Final Refinement ---")
+    logger.info("\n--- Phase 3: Final Refinement ---")
     res2 = least_squares(
         _residuals, res1.x, args=(model, inliers),
         bounds=(lower, upper),
@@ -124,18 +131,38 @@ def run_calibration(config: SceneConfig,
     refined_f = model.f * p[4]
     final_rmse = np.sqrt(np.mean(res2.fun ** 2))
 
-    print("\n" + "=" * 40)
-    print("FINAL CALIBRATION RESULTS")
-    print("=" * 40)
-    print(f"Time Shift : {p[0]:.4f} s")
-    print(f"Roll       : {p[1]:.4f}°")
-    print(f"Pitch      : {p[2]:.4f}°")
-    print(f"Yaw        : {p[3]:.4f}°")
-    print(f"Focal Len  : {refined_f:.1f} px (scale {p[4]:.4f})")
-    print(f"Distortion : k1={p[5]:.6f}  k2={p[6]:.6f}")
-    print(f"CX Rate    : {p[7]:.6f} px/line")
-    print(f"Along Rate : {p[8]:.6f}")
-    print(f"RMSE       : {final_rmse:.1f} m")
+    logger.info("\n" + "=" * 40)
+    logger.info("FINAL CALIBRATION RESULTS")
+    logger.info("=" * 40)
+    logger.info(f"Time Shift : {p[0]:.4f} s")
+    logger.info(f"Roll       : {p[1]:.4f}°")
+    logger.info(f"Pitch      : {p[2]:.4f}°")
+    logger.info(f"Yaw        : {p[3]:.4f}°")
+    logger.info(f"Focal Len  : {refined_f:.1f} px (scale {p[4]:.4f})")
+    logger.info(f"Distortion : k1={p[5]:.6f}  k2={p[6]:.6f}")
+    logger.info(f"CX Rate    : {p[7]:.6f} px/line")
+    logger.info(f"Along Rate : {p[8]:.6f}")
+    logger.info(f"Roll Rate  : {p[9]:.6f} °/norm")
+    logger.info(f"Pitch Rate : {p[10]:.6f} °/norm")
+    logger.info(f"Yaw Rate   : {p[11]:.6f} °/norm")
+    logger.info(f"RMSE       : {final_rmse:.1f} m")
+
+    # Warn if any rate param is large — suggests real attitude drift
+    drift_mag = np.hypot(p[9], np.hypot(p[10], p[11]))
+    if drift_mag > 0.5:
+        logger.warning(
+            f"Large attitude drift detected ({drift_mag:.3f}°). "
+            f"Consider checking AOCS data quality.")
+
+    # Warn if solution hit a bound
+    for i, (val, lo, hi) in enumerate(zip(p, lower, upper)):
+        if abs(val - lo) < 1e-6 or abs(val - hi) < 1e-6:
+            names = ['time_shift','roll','pitch','yaw','f_scale',
+                     'k1','k2','cx_rate','along_rate',
+                     'roll_rate','pitch_rate','yaw_rate']
+            logger.warning(
+                f"Parameter '{names[i]}' hit bound ({val:.6f}). "
+                f"Model may be under-constrained.")
 
     calib = {
         "f": refined_f,
@@ -149,6 +176,9 @@ def run_calibration(config: SceneConfig,
         "yaw": p[3],
         "cx_rate": p[7],
         "along_rate": p[8],
+        "roll_rate": p[9],
+        "pitch_rate": p[10],
+        "yaw_rate": p[11],
     }
 
     stats = {
@@ -159,6 +189,6 @@ def run_calibration(config: SceneConfig,
 
     if config.calib_json:
         save_calibration(calib, str(config.calib_path), stats=stats)
-        print(f"Saved → {config.calib_path}")
+        logger.info("Saved → %s", config.calib_path)
 
     return calib
