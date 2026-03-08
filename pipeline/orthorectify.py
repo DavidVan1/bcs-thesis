@@ -12,10 +12,12 @@ Pipeline:
 import warnings
 warnings.filterwarnings("ignore")
 
+import logging
 import numpy as np
 import json
 from pathlib import Path
 from typing import Optional, Tuple
+from pyproj import Transformer
 
 import rasterio
 from rasterio.transform import Affine
@@ -35,8 +37,16 @@ from .config import SceneConfig
 from .sensor_model import PhiSatPushbroomModel, R_EARTH, create_model
 from .utils import load_calibration
 
+logger = logging.getLogger(__name__)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _utm_epsg_from_lonlat(lon: float, lat: float) -> int:
+    """Return EPSG code for the UTM zone containing (lon, lat)."""
+    zone = int(np.floor((lon + 180.0) / 6.0)) + 1
+    zone = max(1, min(zone, 60))
+    return (32600 + zone) if lat >= 0 else (32700 + zone)
 
 class OrthorectificationEngine:
     """
@@ -62,9 +72,9 @@ class OrthorectificationEngine:
         self.phisat_data = self.phisat_src.read()
         self.phisat_shape = self.phisat_data.shape
 
-        print(f"DEM shape      : {self.dem_data.shape}")
-        print(f"DEM CRS        : {self.dem_crs}")
-        print(f"PhiSat shape   : {self.phisat_shape}")
+        logger.info("DEM shape      : %s", self.dem_data.shape)
+        logger.info("DEM CRS        : %s", self.dem_crs)
+        logger.info("PhiSat shape   : %s", self.phisat_shape)
 
         self._apply_calibration()
 
@@ -76,27 +86,31 @@ class OrthorectificationEngine:
         self.calib_time_shift = p.get("time_shift", 0.0)
         self.cx_rate = p.get("cx_rate", 0.0)
         self.along_rate = p.get("along_rate", 0.0)
+        self.roll_rate  = p.get("roll_rate",  0.0)
+        self.pitch_rate = p.get("pitch_rate", 0.0)
+        self.yaw_rate   = p.get("yaw_rate",   0.0)
 
         self.mounting_bias = {
             "roll": p.get("roll", 0.0),
             "pitch": p.get("pitch", 0.0),
             "yaw": p.get("yaw", 0.0),
         }
-        self._rot_bias = SciRot.from_euler("xyz", [
-            self.mounting_bias["roll"],
-            self.mounting_bias["pitch"],
-            self.mounting_bias["yaw"],
-        ], degrees=True)
 
-        self._R_b2o = self.model.quaternion_to_rotation_matrix(
-            self.model.quaternion)
+        # NOTE: _rot_bias is NOT pre-cached here because the effective
+        # rotation varies per scanline when drift rates are non-zero.
+        # It is computed inside _forward_biased on every call.
 
-        print(f"Calibration: f={self.model.f:.1f}  "
-              f"R={self.mounting_bias['roll']:.3f}°  "
-              f"P={self.mounting_bias['pitch']:.3f}°  "
-              f"Y={self.mounting_bias['yaw']:.3f}°  "
-              f"cx_rate={self.cx_rate:.6f}  "
-              f"along_rate={self.along_rate:.6f}")
+        logger.info(
+            "Calibration: f=%.1f  R=%.4f°  P=%.4f°  Y=%.4f°  "
+            "cx_rate=%.6f  along_rate=%.6f",
+            self.model.f,
+            self.mounting_bias['roll'], self.mounting_bias['pitch'],
+            self.mounting_bias['yaw'],
+            self.cx_rate, self.along_rate)
+        if any(abs(r) > 1e-6 for r in [self.roll_rate, self.pitch_rate, self.yaw_rate]):
+            logger.info(
+                "  Attitude drift: roll_rate=%.6f°  pitch_rate=%.6f°  yaw_rate=%.6f°",
+                self.roll_rate, self.pitch_rate, self.yaw_rate)
 
     # ── DEM query ───────────────────────────────────────────────────
 
@@ -120,24 +134,42 @@ class OrthorectificationEngine:
     # ── forward projection with bias ────────────────────────────────
 
     def _forward_biased(self, u: float, v: float) -> Optional[np.ndarray]:
-        """Forward-project pixel (u, v) → ECEF using calibrated model."""
-        # Cross-track drift: effective cx shifts linearly with scanline
+        """Forward-project pixel (u, v) → ECEF using calibrated model.
+
+        Per-scanline rotation: R_b2o is recomputed each call from the
+        AOCS quaternion (does not change with scanline, but R_o2e does).
+        Attitude drift rates produce a scanline-dependent mounting bias
+        applied before the body→orbital rotation.
+        """
+        # Normalised scanline in [−0.5, 0.5], matching RobustModel convention
+        norm_v = ((v - self.model.cy) / (2.0 * self.model.cy)
+                  if self.model.cy > 0 else 0.0)
+
+        # Effective attitude: constant bias + linear drift per scanline
+        r_eff = self.mounting_bias["roll"]  + self.roll_rate  * norm_v
+        p_eff = self.mounting_bias["pitch"] + self.pitch_rate * norm_v
+        y_eff = self.mounting_bias["yaw"]   + self.yaw_rate   * norm_v
+        rot_bias = SciRot.from_euler("xyz", [r_eff, p_eff, y_eff], degrees=True)
+
+        # Cross-track drift
         cx_eff = self.model.cx + self.cx_rate * (v - self.model.cy)
         x_norm = (u - cx_eff) / self.model.f
         r2 = x_norm ** 2
         dist = 1.0 + self.model.k1 * r2 + self.model.k2 * r2 ** 2
+
+        # Body frame: X = along-track, Y = cross-track, Z = boresight
         ray_cam = np.array([0.0, x_norm * dist, 1.0])
         ray_cam /= np.linalg.norm(ray_cam)
-
-        ray_body = self._rot_bias.apply(ray_cam)
+        ray_body = rot_bias.apply(ray_cam)
 
         t = self.model.scanline_to_time(v) + self.calib_time_shift
         dt = t - self.model.t0
         sat_pos = self.model.position + self.model.velocity * dt * (1.0 + self.along_rate)
 
-        R_o2e = self.model.get_orbital_rotation_matrix(
-            sat_pos, self.model.velocity)
-        ray_world = R_o2e @ self._R_b2o @ ray_body
+        # R_b2o from nominal AOCS quaternion; R_o2e per-scanline from sat_pos
+        R_b2o = self.model.quaternion_to_rotation_matrix(self.model.quaternion)
+        R_o2e = self.model.get_orbital_rotation_matrix(sat_pos, self.model.velocity)
+        ray_world = R_o2e @ R_b2o @ ray_body
 
         a = np.dot(ray_world, ray_world)
         b = 2.0 * np.dot(sat_pos, ray_world)
@@ -209,8 +241,12 @@ class OrthorectificationEngine:
                 du = (pp - pm) / (2 * d)
                 dv = (vp - vm) / (2 * d)
                 J = np.column_stack([du, dv])
+                if not np.all(np.isfinite(J)):
+                    return None
                 try:
                     delta = -np.linalg.lstsq(J, res, rcond=None)[0]
+                    if not np.all(np.isfinite(delta)):
+                        return None
                     u += delta[0]
                     v += delta[1]
                 except Exception:
@@ -261,12 +297,12 @@ class OrthorectificationEngine:
 
     def orthorectify(self) -> Optional[Tuple[np.ndarray, Affine, CRS]]:
         """Run the full orthorectification.  Returns (data, transform, crs)."""
-        print("\n" + "=" * 60)
-        print("ORTHORECTIFICATION")
-        print("=" * 60)
+        logger.info("\n" + "=" * 60)
+        logger.info("ORTHORECTIFICATION")
+        logger.info("=" * 60)
 
         # Step 1: Footprint
-        print("\n[1] Computing calibrated image footprint…")
+        logger.info("\n[1] Computing calibrated image footprint...")
         corners = [
             (0, 0),
             (self.phisat_shape[2] - 1, 0),
@@ -282,7 +318,7 @@ class OrthorectificationEngine:
                 lons.append(ll[0])
                 lats.append(ll[1])
         if len(lons) < 2:
-            print("  ERROR: cannot compute footprint")
+            logger.error("  ERROR: cannot compute footprint")
             return None
 
         margin = 0.02
@@ -296,24 +332,42 @@ class OrthorectificationEngine:
         o_s = max(fp_s, db.bottom)
         o_n = min(fp_n, db.top)
         if o_w >= o_e or o_s >= o_n:
-            print("  ERROR: footprint outside DEM")
+            logger.error("  ERROR: footprint outside DEM")
             return None
 
-        res_x = abs(self.dem_transform.a)
-        res_y = abs(self.dem_transform.e)
-        out_w = int(np.ceil((o_e - o_w) / res_x))
-        out_h = int(np.ceil((o_n - o_s) / res_y))
-        print(f"  Output: {out_w}×{out_h}  res {res_x:.6f}°")
+        # Target output grid in local UTM (metric) with square 4.75 m pixels.
+        target_gsd_m = 4.75
+        lon_c = 0.5 * (o_w + o_e)
+        lat_c = 0.5 * (o_s + o_n)
+        out_crs = CRS.from_epsg(_utm_epsg_from_lonlat(lon_c, lat_c))
+        ll_to_out = Transformer.from_crs("EPSG:4326", out_crs, always_xy=True)
+        out_to_ll = Transformer.from_crs(out_crs, "EPSG:4326", always_xy=True)
 
-        lons_arr = np.linspace(o_w, o_e, out_w)
-        lats_arr = np.linspace(o_n, o_s, out_h)
+        bbox_lonlat = [(o_w, o_s), (o_w, o_n), (o_e, o_s), (o_e, o_n)]
+        bbox_x, bbox_y = ll_to_out.transform(
+            [pt[0] for pt in bbox_lonlat],
+            [pt[1] for pt in bbox_lonlat],
+        )
 
-        out_tf = Affine((o_e - o_w) / out_w, 0, o_w,
-                        0, -(o_n - o_s) / out_h, o_n)
+        x_min, x_max = float(min(bbox_x)), float(max(bbox_x))
+        y_min, y_max = float(min(bbox_y)), float(max(bbox_y))
+
+        x_res = target_gsd_m
+        y_res = target_gsd_m
+        out_w = int(np.ceil((x_max - x_min) / x_res))
+        out_h = int(np.ceil((y_max - y_min) / y_res))
+        logger.info("  Output: %d×%d  res %.2f m  CRS %s", out_w, out_h, target_gsd_m, out_crs)
+
+        # Pixel-centre coordinates (consistent with out_tf below).
+        x_arr = x_min + (np.arange(out_w, dtype=np.float64) + 0.5) * x_res
+        y_arr = y_max - (np.arange(out_h, dtype=np.float64) + 0.5) * y_res
+
+        out_tf = Affine(x_res, 0, x_min,
+                0, -y_res, y_max)
 
         # Step 2: Sparse LUT
-        print("\n[2] Building sparse LUT…")
-        lut_step = 10
+        logger.info("\n[2] Building sparse LUT...")
+        lut_step = max(10, max(out_h, out_w) // 100)
         rows_lut = np.arange(0, out_h, lut_step, dtype=int)
         cols_lut = np.arange(0, out_w, lut_step, dtype=int)
         if rows_lut[-1] != out_h - 1:
@@ -330,12 +384,13 @@ class OrthorectificationEngine:
 
         for i, ri in enumerate(rows_lut):
             if i % max(1, len(rows_lut) // 10) == 0:
-                print(f"    Row {i}/{len(rows_lut)} "
-                      f"({100 * i / len(rows_lut):.0f}%)")
-            lat = lats_arr[ri]
+                logger.info("    Row %d/%d (%.0f%%)", i, len(rows_lut),
+                            100 * i / len(rows_lut))
+            y = y_arr[ri]
             last_v_row = None
             for j, ci in enumerate(cols_lut):
-                lon = lons_arr[ci]
+                x = x_arr[ci]
+                lon, lat = out_to_ll.transform(x, y)
                 hint = (last_v_row if last_v_row is not None
                         else (prev_row_v[j] if not np.isnan(prev_row_v[j])
                               else None))
@@ -349,10 +404,10 @@ class OrthorectificationEngine:
                     fail += 1
                     last_v_row = None
 
-        print(f"  LUT ok={ok}  fail={fail}")
+        logger.info("  LUT ok=%d  fail=%d", ok, fail)
 
         # Step 3: Interpolate
-        print("\n[3] Interpolating LUT…")
+        logger.info("\n[3] Interpolating LUT...")
 
         def _fill_nan(arr):
             mask = np.isnan(arr)
@@ -391,7 +446,7 @@ class OrthorectificationEngine:
         map_v[swath_bad] = np.nan
 
         # Step 4: Resample
-        print("\n[4] Resampling…")
+        logger.info("\n[4] Resampling...")
         n_bands = self.phisat_shape[0]
         ortho = np.zeros((n_bands, out_h, out_w), dtype=np.float32)
 
@@ -416,9 +471,9 @@ class OrthorectificationEngine:
             ortho[b][invalid] = 0
 
         valid_pct = 100 * np.sum(~invalid) / (out_h * out_w)
-        print(f"  Valid pixels: {valid_pct:.1f}%")
+        logger.info("  Valid pixels: %.1f%%", valid_pct)
 
-        return ortho, out_tf, self.dem_crs
+        return ortho, out_tf, out_crs
 
     # ── I/O ─────────────────────────────────────────────────────────
 
@@ -435,7 +490,7 @@ class OrthorectificationEngine:
                            transform=transform, compress="lzw") as dst:
             for b in range(n_bands):
                 dst.write(data[b], b + 1)
-        print(f"Saved GeoTIFF → {path}  ({w}×{h}, {n_bands} bands)")
+        logger.info("Saved GeoTIFF → %s  (%d×%d, %d bands)", path, w, h, n_bands)
 
     def close(self):
         self.dem_src.close()
@@ -453,9 +508,9 @@ def run_orthorectify(config: SceneConfig) -> Optional[str]:
         raise FileNotFoundError(
             "Missing files for orthorectify:\n  " + "\n  ".join(missing))
 
-    print("=" * 60)
-    print(f"ORTHORECTIFY — scene '{config.name}'")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("ORTHORECTIFY — scene '%s'", config.name)
+    logger.info("=" * 60)
 
     model = create_model(config)
     calib = load_calibration(str(config.calib_path))
@@ -477,5 +532,5 @@ def run_orthorectify(config: SceneConfig) -> Optional[str]:
     engine.write_geotiff(ortho_data, transform, crs, out)
     engine.close()
 
-    print(f"\nOrthorectification complete → {out}")
+    logger.info("Orthorectification complete → %s", out)
     return out
