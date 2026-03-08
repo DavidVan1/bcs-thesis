@@ -6,6 +6,7 @@ Given only the phisat folder (AOCS.json + GL_scene_0.json), downloads:
   1. Sentinel-2 L1C imagery  – Google Earth Engine (COPERNICUS/S2_HARMONIZED)
   2. Copernicus DEM GLO-30    – Google Earth Engine (COPERNICUS/DEM/GLO30)
   3. Copernicus GCP database  – ESA S2 GRI HTTPS tiles
+  4. US national ortho (optional, US only) – USDA NAIP via Google Earth Engine
 
 Usage (CLI):
     python -m pipeline.run <scene> fetch
@@ -25,6 +26,7 @@ Google Earth Engine authentication:
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -38,6 +40,8 @@ from typing import Optional, Tuple
 import numpy as np
 
 from .config import SceneConfig, PROJECT_ROOT
+
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -81,6 +85,28 @@ def _expand_bbox(
         lon_max + margin_deg,
         lat_max + margin_deg,
     )
+
+
+def _adaptive_fetch_margin(
+    lon_min: float, lat_min: float,
+    lon_max: float, lat_max: float,
+    *,
+    ratio: float = 0.10,
+    min_deg: float = 0.01,
+    max_deg: float = 0.05,
+) -> float:
+    """
+    Compute a scene-size-aware margin (degrees) for fetch-time AOIs.
+
+    A fixed large margin can excessively enlarge the Sentinel search region,
+    causing slow date scoring and very low coverage percentages. This helper
+    keeps a small proportional pad while clamping to sensible bounds.
+    """
+    span_lon = max(0.0, lon_max - lon_min)
+    span_lat = max(0.0, lat_max - lat_min)
+    span = max(span_lon, span_lat)
+    margin = span * ratio
+    return max(min_deg, min(max_deg, margin))
 
 
 def _load_acquisition_time(phisat_dir: Path) -> Optional[str]:
@@ -152,6 +178,15 @@ def download_sentinel(
     actual cloud fraction inside the footprint.  The TCI mosaic is then
     built from S2_HARMONIZED (L1C) for the same date.
     """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    existing_tci = sorted(out_dir.glob("sentinel_TCI_*.tif"))
+    if existing_tci:
+        chosen = existing_tci[-1]
+        logger.info("  Sentinel-2 already exists — skipping search/download: %s", chosen.name)
+        return chosen
+
     try:
         import ee
         from geedim.mask import BaseImage
@@ -170,13 +205,15 @@ def download_sentinel(
             "Run:  earthengine authenticate --auth_mode=notebook"
         )
 
-    print(f"\n  Sentinel-2 TCI — bounding box: "
-          f"[{lon_min:.4f},{lon_max:.4f}] x [{lat_min:.4f},{lat_max:.4f}]")
+    logger.info(
+        "  Sentinel-2 TCI — bounding box: "
+        "[%.4f,%.4f] x [%.4f,%.4f]",
+        lon_min, lon_max, lat_min, lat_max)
 
     region = ee.Geometry.Rectangle([lon_min, lat_min, lon_max, lat_max])
 
     def _best_date(start: str, end: str, cloud_limit: float,
-                   min_coverage: float = 0.90):
+                   min_coverage: float = 0.80):
         """
         Find the date with the lowest cloud fraction AND sufficient spatial
         coverage of the ROI.
@@ -200,7 +237,7 @@ def download_sentinel(
         if size == 0:
             return None, None
 
-        print(f"    {size} granule(s) in window — scoring ROI cloud + coverage ...")
+        logger.info("    %d granule(s) in window — scoring ROI cloud + coverage ...", size)
 
         # ── per-granule cloud scoring ──
         def add_date_cloud(img):
@@ -252,14 +289,15 @@ def download_sentinel(
             if coverage is None:
                 coverage = 0.0
             n_gran = len(date_fracs[date_str])
-            print(f"    {date_str}  cloud {frac:5.2f}%  coverage {coverage*100:5.1f}%  "
-                  f"({n_gran} granule(s))")
+            logger.info("    %s  cloud %5.2f%%  coverage %5.1f%%  (%d granule(s))",
+                        date_str, frac, coverage * 100, n_gran)
 
             if coverage >= min_coverage:
                 return date_str, frac
 
-        print(f"    No date with cloud < {cloud_limit}% and coverage >= "
-              f"{min_coverage*100:.0f}%")
+        logger.info(
+            "    No date with cloud < %.0f%% and coverage >= %.0f%%",
+            cloud_limit, min_coverage * 100)
         return None, None
 
     # ── pass 1: around acquisition date ───────────────────────────
@@ -270,35 +308,33 @@ def download_sentinel(
         td = datetime.timedelta(days=date_window_days)
         start = (dt - td).strftime("%Y-%m-%d")
         end   = (dt + td).strftime("%Y-%m-%d")
-        print(f"  Pass 1 — {start} -> {end}  (ROI cloud <= {max_cloud_pct}%)")
+        logger.info("  Pass 1 — %s -> %s  (ROI cloud <= %.0f%%)", start, end, max_cloud_pct)
         best_date, cloud_frac = _best_date(start, end, max_cloud_pct)
 
     # ── pass 2: full archive ───────────────────────────────────────
     if best_date is None:
-        print(f"  Pass 2 — full archive  (ROI cloud <= {max_cloud_pct}%)")
+        logger.info("  Pass 2 — full archive  (ROI cloud <= %.0f%%)", max_cloud_pct)
         best_date, cloud_frac = _best_date("2015-01-01", "2099-01-01", max_cloud_pct)
 
     # ── pass 3: relaxed cloud ──────────────────────────────────────
     if best_date is None:
-        print(f"  Pass 3 — full archive, cloud <= 30%")
+        logger.info("  Pass 3 — full archive, cloud <= 30%%")
         best_date, cloud_frac = _best_date("2015-01-01", "2099-01-01", 30.0)
 
     # ── pass 4: no cloud filter ────────────────────────────────────
     if best_date is None:
-        print(f"  Pass 4 — full archive, no cloud filter")
+        logger.info("  Pass 4 — full archive, no cloud filter")
         best_date, cloud_frac = _best_date("2015-01-01", "2099-01-01", 100.0)
         if best_date is None:
             raise RuntimeError("No Sentinel-2 images found for the given footprint.")
 
-    print(f"  Selected date       : {best_date}")
-    print(f"  Cloud (footprint)   : {cloud_frac:.2f}%")
+    logger.info("  Selected date       : %s", best_date)
+    logger.info("  Cloud (footprint)   : %.2f%%", cloud_frac)
 
-    out_dir = output_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
     out_tif = out_dir / f"sentinel_TCI_{best_date}.tif"
 
     if out_tif.exists():
-        print(f"  Already exists — skipping download: {out_tif.name}")
+        logger.info("  Already exists — skipping download: %s", out_tif.name)
         return out_tif
 
     # Build TCI mosaic from L1C (S2_HARMONIZED) on the best date.
@@ -316,15 +352,15 @@ def download_sentinel(
 
     l1c_day = _tci_col("COPERNICUS/S2_HARMONIZED")
     if l1c_day.size().getInfo() == 0:
-        print(f"  L1C collection empty for {best_date} — using SR collection for TCI")
+        logger.warning("  L1C collection empty for %s — using SR collection for TCI", best_date)
         l1c_day = _tci_col("COPERNICUS/S2_SR_HARMONIZED")
 
     n_granules = l1c_day.size().getInfo()
-    print(f"  Mosaicking {n_granules} granule(s) for {best_date}")
+    logger.info("  Mosaicking %d granule(s) for %s", n_granules, best_date)
     tci_mosaic = _make_tci(l1c_day.mosaic()).clip(region)
     gd_img = BaseImage(tci_mosaic)
 
-    print(f"  Downloading TCI to {out_tif} ...")
+    logger.info("  Downloading TCI to %s ...", out_tif)
     gd_img.download(
         str(out_tif),
         region=region,
@@ -333,7 +369,7 @@ def download_sentinel(
         dtype="uint8",
         overwrite=True,
     )
-    print(f"  Saved: {out_tif}")
+    logger.info("  Saved: %s", out_tif)
     return out_tif
 
 
@@ -370,12 +406,14 @@ def download_dem(
             "Run:  earthengine authenticate"
         )
 
-    print(f"\n  Copernicus DEM GLO-30 — bbox: "
-          f"[{lon_min:.4f},{lon_max:.4f}] × [{lat_min:.4f},{lat_max:.4f}]")
+    logger.info(
+        "  Copernicus DEM GLO-30 — bbox: "
+        "[%.4f,%.4f] × [%.4f,%.4f]",
+        lon_min, lon_max, lat_min, lat_max)
 
     output_path = Path(output_path)
     if output_path.exists():
-        print(f"  Already exists — skipping download: {output_path.name}")
+        logger.info("  Already exists — skipping download: %s", output_path.name)
         return output_path
 
     region = ee.Geometry.Rectangle([lon_min, lat_min, lon_max, lat_max])
@@ -391,7 +429,7 @@ def download_dem(
     gd_img = BaseImage(dem)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"  Downloading to {output_path} …")
+    logger.info("  Downloading to %s ...", output_path)
     gd_img.download(
         str(output_path),
         region=region,
@@ -400,8 +438,119 @@ def download_dem(
         dtype="float32",
         overwrite=True,
     )
-    print(f"  ✓ Saved: {output_path}")
+    logger.info("  Saved: %s", output_path)
     return output_path
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# US national mapping (NAIP) via Google Earth Engine
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _bbox_is_us(lon_min: float, lat_min: float,
+                lon_max: float, lat_max: float) -> bool:
+    """Heuristic test for U.S. coverage (CONUS + Alaska + Hawaii + PR)."""
+    c_lon = 0.5 * (lon_min + lon_max)
+    c_lat = 0.5 * (lat_min + lat_max)
+    return (-170.0 <= c_lon <= -60.0) and (18.0 <= c_lat <= 72.0)
+
+
+def download_us_national_ortho(
+    lon_min: float, lat_min: float,
+    lon_max: float, lat_max: float,
+    acq_date: Optional[str],
+    output_dir: Path,
+    *,
+    scale_m: float = 2.0,
+    max_raw_gb: float = 2.5,
+) -> Optional[Path]:
+    """
+    Download a USDA NAIP ortho mosaic (RGB) for the AOI.
+
+    NAIP is a free U.S. national aerial ortho source, suitable as an
+    independent high-resolution reference layer for validation.
+    """
+    if not _bbox_is_us(lon_min, lat_min, lon_max, lat_max):
+        logger.info("  US national mapping skipped (footprint outside U.S.).")
+        return None
+
+    try:
+        import ee
+        from geedim.mask import BaseImage
+    except ImportError:
+        logger.info("  US national mapping skipped: missing earthengine-api/geedim")
+        return None
+
+    try:
+        ee.Initialize(opt_url="https://earthengine.googleapis.com")
+    except ee.EEException:
+        logger.info("  US national mapping skipped: Earth Engine not authenticated")
+        return None
+
+    region = ee.Geometry.Rectangle([lon_min, lat_min, lon_max, lat_max])
+
+    # Estimate raw RGB uint8 size and auto-coarsen scale when too large.
+    # This avoids accidental 10+ GB exports for big AOIs at 1 m.
+    lat_c = 0.5 * (lat_min + lat_max)
+    m_per_deg_lat = 111_132.0
+    m_per_deg_lon = 111_320.0 * max(math.cos(math.radians(lat_c)), 1e-6)
+    width_m = max((lon_max - lon_min) * m_per_deg_lon, 1.0)
+    height_m = max((lat_max - lat_min) * m_per_deg_lat, 1.0)
+
+    eff_scale = float(scale_m)
+    raw_bytes = (width_m / eff_scale) * (height_m / eff_scale) * 3.0
+    raw_gb = raw_bytes / 1e9
+    if raw_gb > max_raw_gb:
+        factor = math.sqrt(raw_gb / max_raw_gb)
+        eff_scale *= factor
+        raw_bytes = (width_m / eff_scale) * (height_m / eff_scale) * 3.0
+        raw_gb = raw_bytes / 1e9
+        logger.warning(
+            "  NAIP AOI is large; auto-adjusting scale to %.2f m "
+            "(estimated raw %.2f GB)", eff_scale, raw_gb)
+
+    # Prefer acquisition-year ±2y; fallback to full archive latest mosaic.
+    naip = ee.ImageCollection("USDA/NAIP/DOQQ").filterBounds(region)
+
+    import datetime
+    year_tag = "latest"
+    if acq_date:
+        try:
+            y = datetime.datetime.strptime(acq_date, "%Y-%m-%d").year
+            start = f"{max(2003, y-2)}-01-01"
+            end = f"{y+2}-12-31"
+            cand = naip.filterDate(start, end)
+            if cand.size().getInfo() > 0:
+                naip = cand
+                year_tag = f"{max(2003, y-2)}_{y+2}"
+        except Exception:
+            pass
+
+    count = naip.size().getInfo()
+    if count == 0:
+        logger.info("  US national mapping skipped: no NAIP imagery found for AOI")
+        return None
+
+    # Cloud-free aerial ortho; use median to smooth seam differences.
+    img = naip.select(["R", "G", "B"]).median().clip(region).toUint8()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_tif = output_dir / f"us_naip_{year_tag}.tif"
+    if out_tif.exists():
+        logger.info("  US national ortho already exists — skipping: %s", out_tif.name)
+        return out_tif
+
+    logger.info("  US national ortho (NAIP): %d tile(s) -> %s", count, out_tif.name)
+    gd_img = BaseImage(img)
+    gd_img.download(
+        str(out_tif),
+        region=region,
+        scale=eff_scale,
+        crs="EPSG:4326",
+        dtype="uint8",
+        overwrite=True,
+    )
+    logger.info("  Saved US national ortho: %s", out_tif)
+    return out_tif
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -503,7 +652,7 @@ def download_gcps(
     import tempfile
 
     tiles = _deg1_tile_names(lon_min, lat_min, lon_max, lat_max)
-    print(f"\n  GCP tiles needed: {tiles}")
+    logger.info("  GCP tiles needed: %s", tiles)
 
     gcp_dir.mkdir(parents=True, exist_ok=True)
     chip_dir = gcp_dir / "L1C_chips"
@@ -517,13 +666,13 @@ def download_gcps(
 
         # Check if already fully downloaded
         if json_dest.exists():
-            print(f"  {tile} — already exists, skipping")
+            logger.info("  %s — already exists, skipping", tile)
             json_paths.append(json_dest)
             continue
 
         url = _wasabi_gri_url(tile)
-        print(f"  Downloading {tile} from Wasabi S3 …")
-        print(f"    {url}")
+        logger.info("  Downloading %s from Wasabi S3 ...", tile)
+        logger.info("    %s", url)
 
         # Stream tar.gz into a temp file, then extract
         with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
@@ -531,8 +680,8 @@ def download_gcps(
 
         try:
             if not _try_download_url(url, tmp_path):
-                print(f"  ✗ Could not download {tile}_L1C.tar.gz")
-                print(f"    Manual download: {url}")
+                logger.warning("    Could not download %s_L1C.tar.gz", tile)
+                logger.warning("    Manual download: %s", url)
                 tmp_path.unlink(missing_ok=True)
                 continue
 
@@ -555,11 +704,12 @@ def download_gcps(
 
             if json_dest.exists():
                 n_chips = len(list(chip_dir.glob("*.TIF"))) if include_chips else 0
-                print(f"  ✓ {tile}.json extracted"
-                      + (f"  ({n_chips} chips)" if include_chips else ""))
+                logger.info(
+                    "  %s.json extracted%s", tile,
+                    f"  ({n_chips} chips)" if include_chips else "")
                 json_paths.append(json_dest)
             else:
-                print(f"  ✗ {tile}.json not found inside archive")
+                logger.warning("  %s.json not found inside archive", tile)
 
         finally:
             tmp_path.unlink(missing_ok=True)
@@ -580,17 +730,20 @@ def _build_scene_config_block(
     dem_rel: str,
     gcp_json_rel: str,
     gcp_chip_rel: str,
+    us_national_ortho_rel: Optional[str],
 ) -> str:
     """Return a ready-to-paste SceneConfig(...) block."""
     meta_line = f'\n        metadata_json="{metadata_json}",' if metadata_json else ""
     gcp_json_line = f'\n        gcp_json="{gcp_json_rel}",' if gcp_json_rel else ""
+    us_mapping_line = (f'\n        us_national_ortho="{us_national_ortho_rel}",'
+                       if us_national_ortho_rel else "")
     return f"""
     "{scene_name}": SceneConfig(
         name="{scene_name}",
         phisat_dir="{phisat_rel}",
         phisat_image="{phisat_image_rel}",{meta_line}
         sentinel_dir="{sentinel_rel}",
-        dem_file="{dem_rel}",{gcp_json_line}
+        dem_file="{dem_rel}",{gcp_json_line}{us_mapping_line}
         gcp_chip_dir="{gcp_chip_rel}",
         tie_points_csv="outputs/{scene_name}/tie_points.csv",
         calib_json="outputs/{scene_name}/calibration.json",
@@ -604,31 +757,37 @@ def _build_scene_config_block(
 # Public entry point
 # ═══════════════════════════════════════════════════════════════════════════
 
-def run_fetch(config: SceneConfig, *, no_gcp_chips: bool = False) -> None:
+def run_fetch(config: SceneConfig, *,
+              no_gcp_chips: bool = False,
+              fetch_us_mapping: bool = True) -> None:
     """
     Download Sentinel-2, DEM, and GCP data for a scene.
 
     Uses GL_scene_0.json from the PhiSat folder to derive the footprint.
     All downloads are skipped if the files already exist.
     """
-    print("\n" + "=" * 60)
-    print(f"FETCH — automatic data download — scene '{config.name}'")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("FETCH — automatic data download — scene '%s'", config.name)
+    logger.info("=" * 60)
 
     # ── 1. Derive footprint ────────────────────────────────────────
     phisat_dir = config.phisat_dir_path
-    print(f"\n  PhiSat dir : {phisat_dir}")
+    logger.info("  PhiSat dir : %s", phisat_dir)
 
     lon_min, lat_min, lon_max, lat_max = _load_footprint(phisat_dir)
-    print(f"  Raw footprint : lon [{lon_min:.4f}, {lon_max:.4f}]  "
-          f"lat [{lat_min:.4f}, {lat_max:.4f}]")
+    logger.info(
+        "  Raw footprint : lon [%.4f, %.4f]  lat [%.4f, %.4f]",
+        lon_min, lon_max, lat_min, lat_max)
 
-    # Add margin for Sentinel-2 and DEM (need coverage beyond image edges)
+    # Add a small adaptive margin for Sentinel-2 and DEM.
+    # A fixed 0.15° margin can over-expand compact scenes and slow S2 scoring.
+    fetch_margin = _adaptive_fetch_margin(lon_min, lat_min, lon_max, lat_max)
+    logger.info("  Fetch margin   : %.4f°", fetch_margin)
     s_lon_min, s_lat_min, s_lon_max, s_lat_max = _expand_bbox(
-        lon_min, lat_min, lon_max, lat_max, margin_deg=0.15)
+        lon_min, lat_min, lon_max, lat_max, margin_deg=fetch_margin)
 
     acq_date = _load_acquisition_time(phisat_dir)
-    print(f"  Acquisition date: {acq_date or 'unknown'}")
+    logger.info("  Acquisition date: %s", acq_date or 'unknown')
 
     # ── 2. Sentinel-2 ──────────────────────────────────────────────
     sentinel_dir = PROJECT_ROOT / "sentinel" / f"sentinel_{config.name}"
@@ -644,10 +803,10 @@ def run_fetch(config: SceneConfig, *, no_gcp_chips: bool = False) -> None:
         config.sentinel_dir = str(
             s2_path.parent.relative_to(PROJECT_ROOT)
         )
-        print(f"  Sentinel-2 dir : {config.sentinel_dir}")
+        logger.info("  Sentinel-2 dir : %s", config.sentinel_dir)
     except Exception as e:
-        print(f"\n  ✗ Sentinel-2 download failed: {e}")
-        print("    You can download manually from https://dataspace.copernicus.eu/")
+        logger.error("  Sentinel-2 download failed: %s", e)
+        logger.error("    You can download manually from https://dataspace.copernicus.eu/")
 
     # ── 3. DEM ─────────────────────────────────────────────────────
     dem_dir = PROJECT_ROOT / "DEM"
@@ -660,10 +819,10 @@ def run_fetch(config: SceneConfig, *, no_gcp_chips: bool = False) -> None:
             output_path=dem_path,
         )
         config.dem_file = str(dem_path.relative_to(PROJECT_ROOT))
-        print(f"  DEM file : {config.dem_file}")
+        logger.info("  DEM file : %s", config.dem_file)
     except Exception as e:
-        print(f"\n  ✗ DEM download failed: {e}")
-        print("    You can download manually from https://opentopography.org/")
+        logger.error("  DEM download failed: %s", e)
+        logger.error("    You can download manually from https://opentopography.org/")
 
     # ── 4. GCPs ────────────────────────────────────────────────────
     gcp_dir = PROJECT_ROOT / "gcp" / config.name
@@ -680,20 +839,39 @@ def run_fetch(config: SceneConfig, *, no_gcp_chips: bool = False) -> None:
             config.gcp_chip_dir = str(
                 (gcp_dir / "L1C_chips").relative_to(PROJECT_ROOT)
             )
-            print(f"  GCP JSON  : {config.gcp_json}")
-            print(f"  GCP chips : {config.gcp_chip_dir}")
+            logger.info("  GCP JSON  : %s", config.gcp_json)
+            logger.info("  GCP chips : %s", config.gcp_chip_dir)
     except Exception as e:
-        print(f"\n  ✗ GCP download failed: {e}")
-        print("    You can download manually from https://s2gri.copernicus.eu/")
+        logger.error("  GCP download failed: %s", e)
+        logger.error("    You can download manually from https://s2gri.copernicus.eu/")
 
-    # ── 5. Print config block ───────────────────────────────────────
+    # ── 5. US national mapping (optional, US-only) ─────────────────
+    if fetch_us_mapping:
+        us_out_dir = PROJECT_ROOT / "national" / f"us_{config.name}"
+        # NAIP fetch does not need the large Sentinel/DEM margin.
+        n_lon_min, n_lat_min, n_lon_max, n_lat_max = _expand_bbox(
+            lon_min, lat_min, lon_max, lat_max, margin_deg=0.02)
+        try:
+            us_path = download_us_national_ortho(
+                n_lon_min, n_lat_min, n_lon_max, n_lat_max,
+                acq_date=acq_date,
+                output_dir=us_out_dir,
+            )
+            if us_path is not None:
+                config.us_national_ortho = str(us_path.relative_to(PROJECT_ROOT))
+                logger.info("  US national ortho : %s", config.us_national_ortho)
+        except Exception as e:
+            logger.error("  US national mapping fetch failed: %s", e)
+            logger.info("    Continuing without US national ortho.")
+
+    # ── 6. Print config block ───────────────────────────────────────
     _find_phisat_image(config)
 
-    print("\n" + "=" * 60)
-    print("FETCH COMPLETE")
-    print("=" * 60)
-    print(
-        "\nAdd the following block to pipeline/config.py → SCENES dict:\n"
+    logger.info("=" * 60)
+    logger.info("FETCH COMPLETE")
+    logger.info("=" * 60)
+    logger.info(
+        "\nAdd the following block to pipeline/config.py \u2192 SCENES dict:\n"
     )
     meta_rel = (
         config.metadata_json
@@ -701,7 +879,7 @@ def run_fetch(config: SceneConfig, *, no_gcp_chips: bool = False) -> None:
         else None
     )
     phisat_image_rel = config.phisat_image
-    print(_build_scene_config_block(
+    logger.info(_build_scene_config_block(
         scene_name=config.name,
         phisat_rel=config.phisat_dir,
         phisat_image_rel=phisat_image_rel,
@@ -710,6 +888,7 @@ def run_fetch(config: SceneConfig, *, no_gcp_chips: bool = False) -> None:
         dem_rel=config.dem_file or f"DEM/{config.name}.tif",
         gcp_json_rel=config.gcp_json,  # None if no GCP tile was downloaded
         gcp_chip_rel=config.gcp_chip_dir or f"gcp/{config.name}/L1C_chips",
+        us_national_ortho_rel=config.us_national_ortho,
     ))
 
 
