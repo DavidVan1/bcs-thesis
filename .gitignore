@@ -4,6 +4,8 @@
 !/third_party/
 !/environment.yml
 
+scenes.json
+
 __pycache__/
 *.py[cod]
 *$py.class
