@@ -19,152 +19,221 @@ Examples:
 Available matchers: lightglue, aliked, xoftr, loftr, efficientloftr, roma, mast3r, dust3r
 """
 
+from __future__ import annotations
+
 import argparse
 import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Dict, Optional, Sequence
 
 from .config import get_scene_config, list_scenes, SceneConfig
 
 logger = logging.getLogger(__name__)
 
 
-STAGES = ["all", "fetch", "match", "calibrate", "orthorectify", "verify"]
-MATCHER_CHOICES = [
-    "lightglue",
-    "aliked",
-    "xoftr",
-    "loftr",
-    "efficientloftr",
-    "roma",
-    "mast3r",
-    "dust3r",
-]
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage registry
+# ═══════════════════════════════════════════════════════════════════════════
+
+MATCHER_CHOICES: Sequence[str] = (
+    "lightglue", "aliked", "xoftr", "loftr",
+    "efficientloftr", "roma", "mast3r", "dust3r",
+)
+
+# Ordered sequence of stages in their natural pipeline order.
+PIPELINE_ORDER: Sequence[str] = (
+    "fetch", "match", "calibrate", "orthorectify", "verify",
+)
+
+# Valid CLI stage names (includes "all").
+STAGE_CHOICES: Sequence[str] = ("all", *PIPELINE_ORDER)
 
 
-def run_fetch_stage(config: SceneConfig) -> None:
+@dataclass(frozen=True)
+class StageContext:
+    """Runtime context passed to every stage runner."""
+    config: SceneConfig
+    matcher_name: str = "lightglue"
+    verify_method: str = "all"
+    reference_source: str = "sentinel"
+    no_gcp_chips: bool = False
+    fetch_us_mapping: bool = True
+
+
+# Type alias for a stage function:  (StageContext) -> None
+StageRunner = Callable[[StageContext], None]
+
+# Registry mapping stage name → runner function
+_STAGE_REGISTRY: Dict[str, StageRunner] = {}
+
+
+def register_stage(name: str) -> Callable[[StageRunner], StageRunner]:
+    """Decorator to register a pipeline stage."""
+    def _decorator(fn: StageRunner) -> StageRunner:
+        _STAGE_REGISTRY[name] = fn
+        return fn
+    return _decorator
+
+
+# ── Stage implementations ──────────────────────────────────────────────
+
+@register_stage("fetch")
+def _run_fetch(ctx: StageContext) -> None:
     """Download Sentinel-2, DEM and GCPs from Google Earth Engine / Copernicus."""
     from .fetch import run_fetch
-    run_fetch(config)
+    run_fetch(ctx.config,
+              no_gcp_chips=ctx.no_gcp_chips,
+              fetch_us_mapping=ctx.fetch_us_mapping)
 
 
-def run_match(config: SceneConfig, matcher_name: str) -> None:
+@register_stage("match")
+def _run_match(ctx: StageContext) -> None:
     """Run the feature matching stage."""
     from .matching import run_matching
-    run_matching(config, matcher_name=matcher_name)
+    run_matching(ctx.config, matcher_name=ctx.matcher_name)
 
 
-def run_calibrate(config: SceneConfig) -> None:
+@register_stage("calibrate")
+def _run_calibrate(ctx: StageContext) -> None:
     """Run the sensor calibration stage."""
     from .calibration import run_calibration
-    run_calibration(config, verbose=True)
+    run_calibration(ctx.config, verbose=True)
 
 
-def run_orthorectify_stage(config: SceneConfig) -> None:
+@register_stage("orthorectify")
+def _run_orthorectify(ctx: StageContext) -> None:
     """Run the orthorectification stage."""
     from .orthorectify import run_orthorectify
-    run_orthorectify(config)
+    run_orthorectify(ctx.config)
 
 
-def run_verify(config: SceneConfig,
-               method: str = "all",
-               reference_source: str = "sentinel") -> None:
+@register_stage("verify")
+def _run_verify(ctx: StageContext) -> None:
     """Run GCP-based verification (position / NCC or both)."""
     from .verify import run_verification
-    run_verification(config, method=method,
-                     reference_source=reference_source)
+    run_verification(ctx.config, method=ctx.verify_method,
+                     reference_source=ctx.reference_source)
 
 
-def run_all(config: SceneConfig,
-            matcher_name: str,
-            reference_source: str = "sentinel") -> None:
-    """Run the complete pipeline: fetch → match → calibrate → orthorectify → verify."""
+# ── Pipeline orchestrator ──────────────────────────────────────────────
+
+def run_pipeline(ctx: StageContext,
+                 stages: Sequence[str] | None = None) -> None:
+    """
+    Execute one or more pipeline stages in order.
+
+    Parameters
+    ----------
+    ctx : StageContext
+    stages : sequence of stage names, or None for the full pipeline.
+    """
+    if stages is None:
+        stages = PIPELINE_ORDER
+
     logger.info("\n" + "=" * 70)
-    logger.info("  PHISAT-2 ORTHORECTIFICATION PIPELINE — scene '%s'", config.name)
+    logger.info("  PHISAT-2 ORTHORECTIFICATION PIPELINE — scene '%s'", ctx.config.name)
+    logger.info("  Stages: %s", " → ".join(stages))
     logger.info("=" * 70 + "\n")
 
-    run_fetch_stage(config)
-    run_match(config, matcher_name)
-    run_calibrate(config)
-    run_orthorectify_stage(config)
-    run_verify(config, method="all", reference_source=reference_source)
+    for name in stages:
+        runner = _STAGE_REGISTRY.get(name)
+        if runner is None:
+            raise ValueError(f"Unknown stage '{name}'. "
+                             f"Available: {', '.join(_STAGE_REGISTRY)}")
+        runner(ctx)
 
     logger.info("\n" + "=" * 70)
     logger.info("  PIPELINE COMPLETE")
     logger.info("=" * 70 + "\n")
 
 
-def main():
+# ═══════════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _build_config(args: argparse.Namespace) -> SceneConfig:
+    """Resolve or bootstrap a SceneConfig from CLI arguments."""
+    try:
+        return get_scene_config(args.scene)
+    except KeyError:
+        pass
+
+    # Scene not in scenes.json — allow fetch to bootstrap it
+    if args.stage == "fetch" and args.phisat_dir:
+        from .fetch import _find_phisat_image
+        config = SceneConfig(
+            name=args.scene,
+            phisat_dir=args.phisat_dir,
+            phisat_image="bands/Bp_0_0_4096_4096_0_0_4096_4096_12_RGB.tiff",
+        )
+        _find_phisat_image(config)
+        return config
+
+    logger.error(
+        "Error: Unknown scene '%s'.\n"
+        "  Available scenes: %s\n"
+        "  To fetch data for a new scene, run:\n"
+        "    python -m pipeline.run %s fetch "
+        "--phisat-dir phisat/phisat_%s",
+        args.scene, ', '.join(list_scenes()),
+        args.scene, args.scene,
+    )
+    sys.exit(1)
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="PhiSat-2 Orthorectification Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__
+        epilog=__doc__,
     )
     parser.add_argument(
-        "scene",
-        nargs="?",
-        type=str,
-        help=f"Scene name. Available: {', '.join(list_scenes())}"
+        "scene", nargs="?", type=str,
+        help=f"Scene name. Available: {', '.join(list_scenes())}",
     )
     parser.add_argument(
-        "stage",
-        nargs="?",
-        default="all",
-        choices=STAGES,
-        help=f"Pipeline stage to run. Default: all. Options: {', '.join(STAGES)}"
+        "stage", nargs="?", default="all",
+        choices=STAGE_CHOICES,
+        help=f"Pipeline stage to run. Default: all. Options: {', '.join(STAGE_CHOICES)}",
     )
     parser.add_argument(
-        "--matcher", "-m",
-        type=str,
-        default="lightglue",
+        "--matcher", "-m", type=str, default="lightglue",
         choices=MATCHER_CHOICES,
-        help=f"Feature matcher. Default: lightglue. Options: {', '.join(MATCHER_CHOICES)}"
+        help=f"Feature matcher. Default: lightglue. Options: {', '.join(MATCHER_CHOICES)}",
     )
     parser.add_argument(
-        "--list-scenes",
-        action="store_true",
-        help="List available scenes and exit."
+        "--list-scenes", action="store_true",
+        help="List available scenes and exit.",
     )
     parser.add_argument(
-        "--list-matchers",
-        action="store_true",
-        help="List available matchers and exit."
+        "--list-matchers", action="store_true",
+        help="List available matchers and exit.",
     )
     parser.add_argument(
-        "--phisat-dir",
-        type=str,
-        default=None,
-        metavar="PATH",
+        "--phisat-dir", type=str, default=None, metavar="PATH",
         help=(
             "Path to the PhiSat folder relative to project root "
             "(e.g. phisat/phisat_new).  Required for 'fetch' when the scene "
-            "is not yet listed in config.py."
+            "is not yet listed in scenes.json."
         ),
     )
     parser.add_argument(
-        "--no-gcp-chips",
-        action="store_true",
+        "--no-gcp-chips", action="store_true",
         help="Skip downloading GCP reference chips during fetch.",
     )
     parser.add_argument(
-        "--no-us-mapping",
-        action="store_true",
+        "--no-us-mapping", action="store_true",
         help="Skip downloading free US national mapping ortho (NAIP) during fetch.",
     )
     parser.add_argument(
-        "--verify-method",
-        type=str,
-        default="all",
+        "--verify-method", type=str, default="all",
         choices=["all", "position", "ncc"],
-        help=(
-            "Verification method: 'position' (A), 'ncc' (B), "
-            "or 'all'. Default: all."
-        ),
+        help="Verification method: 'position' (A), 'ncc' (B), or 'all'. Default: all.",
     )
     parser.add_argument(
-        "--reference-source",
-        type=str,
-        default="sentinel",
+        "--reference-source", type=str, default="sentinel",
         choices=["sentinel", "us_naip"],
         help=(
             "Reference source for NCC verification: 'sentinel' uses ESA GCP "
@@ -175,85 +244,41 @@ def main():
 
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+    # ── Info queries ───────────────────────────────────────────────
     if args.list_scenes:
-        logger.info("Available scenes:")
         for s in list_scenes():
-            logger.info("  - %s", s)
+            logger.info("  %s", s)
         sys.exit(0)
 
     if args.list_matchers:
-        logger.info("Available matchers:")
         for m in MATCHER_CHOICES:
-            logger.info("  - %s", m)
+            logger.info("  %s", m)
         sys.exit(0)
 
     if not args.scene:
         parser.error("the following arguments are required: scene")
 
-    # ── Load or build scene config ─────────────────────────────────
-    from .config import SceneConfig, PROJECT_ROOT
-
-    try:
-        config = get_scene_config(args.scene)
-    except KeyError:
-        # Scene not in config.py — allow fetch to bootstrap it
-        if args.stage == "fetch" and args.phisat_dir:
-            phisat_dir = args.phisat_dir
-            image_rel = "bands/Bp_0_0_4096_4096_0_0_4096_4096_12_RGB.tiff"
-            # Auto-detect image file
-            from .fetch import _find_phisat_image as _fpi
-            tmp = SceneConfig(
-                name=args.scene,
-                phisat_dir=phisat_dir,
-                phisat_image=image_rel,
-            )
-            _fpi(tmp)
-            config = tmp
-        else:
-            logger.error(
-                "Error: Unknown scene '%s'.\n"
-                "  Available scenes: %s\n"
-                "  To fetch data for a new scene, run:\n"
-                "    python -m pipeline.run %s fetch "
-                "--phisat-dir phisat/phisat_%s",
-                args.scene, ', '.join(list_scenes()),
-                args.scene, args.scene,
-            )
-            sys.exit(1)
-
-    # Set matcher-specific output paths
+    # ── Build config + context ─────────────────────────────────────
+    config = _build_config(args)
     config.set_matcher(args.matcher)
 
-    # Dispatch to the selected stage
-    stage = args.stage
+    ctx = StageContext(
+        config=config,
+        matcher_name=args.matcher,
+        verify_method=args.verify_method,
+        reference_source=args.reference_source,
+        no_gcp_chips=getattr(args, "no_gcp_chips", False),
+        fetch_us_mapping=not getattr(args, "no_us_mapping", False),
+    )
 
+    # ── Dispatch ───────────────────────────────────────────────────
+    stage = args.stage
     if stage == "all":
-        run_all(config, args.matcher,
-            reference_source=args.reference_source)
-    elif stage == "fetch":
-        no_chips = getattr(args, "no_gcp_chips", False)
-        no_us_mapping = getattr(args, "no_us_mapping", False)
-        from .fetch import run_fetch
-        run_fetch(config,
-                  no_gcp_chips=no_chips,
-                  fetch_us_mapping=not no_us_mapping)
-    elif stage == "match":
-        run_match(config, args.matcher)
-    elif stage == "calibrate":
-        run_calibrate(config)
-    elif stage == "orthorectify":
-        run_orthorectify_stage(config)
-    elif stage == "verify":
-        run_verify(config, method=args.verify_method,
-                   reference_source=args.reference_source)
+        run_pipeline(ctx)
     else:
-        logger.error("Unknown stage: %s", stage)
-        sys.exit(1)
+        run_pipeline(ctx, stages=[stage])
 
 
 if __name__ == "__main__":
