@@ -44,6 +44,35 @@ from .config import SceneConfig, PROJECT_ROOT
 logger = logging.getLogger(__name__)
 
 
+# ── Constants ────────────────────────────────────────────────────────────
+ESA_TCI_DIVISOR: float = 3558.0  # Hardcoded by the ESA L1C processor
+GEE_ENDPOINT: str = "https://earthengine.googleapis.com"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Google Earth Engine helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _ensure_gee_initialized() -> None:
+    """Import, initialise, and validate GEE access (idempotent)."""
+    try:
+        import ee
+        from geedim.mask import BaseImage  # noqa: F401
+    except ImportError:
+        raise ImportError(
+            "Google Earth Engine packages not found.\n"
+            "Install with:  pip install earthengine-api geedim\n"
+            "Then authenticate once:  earthengine authenticate --auth_mode=notebook"
+        )
+    try:
+        ee.Initialize(opt_url=GEE_ENDPOINT)
+    except ee.EEException:
+        raise RuntimeError(
+            "Google Earth Engine not authenticated.\n"
+            "Run:  earthengine authenticate --auth_mode=notebook"
+        )
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Footprint helpers
 # ═══════════════════════════════════════════════════════════════════════════
@@ -139,8 +168,7 @@ def _make_tci(image):
     """
     Convert a Sentinel-2 L1C image (DN 0-10000) to a TCI-style 3-band uint8
     RGB image matching the official ESA TCI product (R=B4, G=B3, B=B2).
-    ESA TCI formula: clamp(DN / 3558 * 255, 0, 255).toByte()
-    (3558 is the hardcoded divisor used by the ESA L1C processor)
+    ESA TCI formula: clamp(DN / ESA_TCI_DIVISOR * 255, 0, 255).toByte()
 
     Note: copyProperties() returns ee.Element (EE API quirk), so we cast
     back to ee.Image via ee.Image() to preserve the .clip() method.
@@ -148,7 +176,7 @@ def _make_tci(image):
     import ee
     tci = (
         image.select(["B4", "B3", "B2"])
-             .divide(3558).multiply(255)
+             .divide(ESA_TCI_DIVISOR).multiply(255)
              .clamp(0, 255)
              .toByte()
              .rename(["R", "G", "B"])
@@ -187,23 +215,9 @@ def download_sentinel(
         logger.info("  Sentinel-2 already exists — skipping search/download: %s", chosen.name)
         return chosen
 
-    try:
-        import ee
-        from geedim.mask import BaseImage
-    except ImportError:
-        raise ImportError(
-            "Google Earth Engine packages not found.\n"
-            "Install with:  pip install earthengine-api geedim\n"
-            "Then authenticate once:  earthengine authenticate --auth_mode=notebook"
-        )
-
-    try:
-        ee.Initialize(opt_url="https://earthengine.googleapis.com")
-    except ee.EEException:
-        raise RuntimeError(
-            "Google Earth Engine not authenticated.\n"
-            "Run:  earthengine authenticate --auth_mode=notebook"
-        )
+    _ensure_gee_initialized()
+    import ee
+    from geedim.mask import BaseImage
 
     logger.info(
         "  Sentinel-2 TCI — bounding box: "
@@ -389,22 +403,9 @@ def download_dem(
 
     The result is a single GeoTIFF in EPSG:4326 at ~30 m resolution.
     """
-    try:
-        import ee
-        from geedim.mask import BaseImage
-    except ImportError:
-        raise ImportError(
-            "Google Earth Engine packages not found.\n"
-            "Install with:  pip install earthengine-api geedim"
-        )
-
-    try:
-        ee.Initialize(opt_url="https://earthengine.googleapis.com")
-    except ee.EEException:
-        raise RuntimeError(
-            "Google Earth Engine not authenticated.\n"
-            "Run:  earthengine authenticate"
-        )
+    _ensure_gee_initialized()
+    import ee
+    from geedim.mask import BaseImage
 
     logger.info(
         "  Copernicus DEM GLO-30 — bbox: "
@@ -474,16 +475,11 @@ def download_us_national_ortho(
         return None
 
     try:
+        _ensure_gee_initialized()
         import ee
         from geedim.mask import BaseImage
-    except ImportError:
-        logger.info("  US national mapping skipped: missing earthengine-api/geedim")
-        return None
-
-    try:
-        ee.Initialize(opt_url="https://earthengine.googleapis.com")
-    except ee.EEException:
-        logger.info("  US national mapping skipped: Earth Engine not authenticated")
+    except (ImportError, RuntimeError):
+        logger.info("  US national mapping skipped: missing earthengine-api/geedim or not authenticated")
         return None
 
     region = ee.Geometry.Rectangle([lon_min, lat_min, lon_max, lat_max])
@@ -718,42 +714,6 @@ def download_gcps(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Scene auto-config builder
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _build_scene_config_block(
-    scene_name: str,
-    phisat_rel: str,
-    phisat_image_rel: str,
-    metadata_json: Optional[str],
-    sentinel_rel: str,
-    dem_rel: str,
-    gcp_json_rel: str,
-    gcp_chip_rel: str,
-    us_national_ortho_rel: Optional[str],
-) -> str:
-    """Return a ready-to-paste SceneConfig(...) block."""
-    meta_line = f'\n        metadata_json="{metadata_json}",' if metadata_json else ""
-    gcp_json_line = f'\n        gcp_json="{gcp_json_rel}",' if gcp_json_rel else ""
-    us_mapping_line = (f'\n        us_national_ortho="{us_national_ortho_rel}",'
-                       if us_national_ortho_rel else "")
-    return f"""
-    "{scene_name}": SceneConfig(
-        name="{scene_name}",
-        phisat_dir="{phisat_rel}",
-        phisat_image="{phisat_image_rel}",{meta_line}
-        sentinel_dir="{sentinel_rel}",
-        dem_file="{dem_rel}",{gcp_json_line}{us_mapping_line}
-        gcp_chip_dir="{gcp_chip_rel}",
-        tie_points_csv="outputs/{scene_name}/tie_points.csv",
-        calib_json="outputs/{scene_name}/calibration.json",
-        ortho_tif="outputs/{scene_name}/ortho.tif",
-        initial_f=105790.0,
-    ),
-"""
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # Public entry point
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -864,32 +824,35 @@ def run_fetch(config: SceneConfig, *,
             logger.error("  US national mapping fetch failed: %s", e)
             logger.info("    Continuing without US national ortho.")
 
-    # ── 6. Print config block ───────────────────────────────────────
+    # ── 6. Print config suggestion ──────────────────────────────────
     _find_phisat_image(config)
 
     logger.info("=" * 60)
     logger.info("FETCH COMPLETE")
     logger.info("=" * 60)
+    scene_entry = {
+        "phisat_dir": config.phisat_dir,
+        "phisat_image": config.phisat_image,
+    }
+    if config.metadata_json:
+        scene_entry["metadata_json"] = config.metadata_json
+    scene_entry.update({
+        "sentinel_dir": config.sentinel_dir or f"sentinel/sentinel_{config.name}",
+        "dem_file": config.dem_file or f"DEM/{config.name}.tif",
+    })
+    if config.gcp_json:
+        scene_entry["gcp_json"] = config.gcp_json
+    scene_entry["gcp_chip_dir"] = config.gcp_chip_dir or f"gcp/{config.name}/L1C_chips"
+    if config.us_national_ortho:
+        scene_entry["us_national_ortho"] = config.us_national_ortho
+    scene_entry["initial_f"] = config.initial_f
+
+    import json as _json
     logger.info(
-        "\nAdd the following block to pipeline/config.py \u2192 SCENES dict:\n"
+        "\nAdd the following to pipeline/scenes.json:\n"
+        '  "%s": %s', config.name,
+        _json.dumps(scene_entry, indent=4),
     )
-    meta_rel = (
-        config.metadata_json
-        if config.metadata_json
-        else None
-    )
-    phisat_image_rel = config.phisat_image
-    logger.info(_build_scene_config_block(
-        scene_name=config.name,
-        phisat_rel=config.phisat_dir,
-        phisat_image_rel=phisat_image_rel,
-        metadata_json=meta_rel,
-        sentinel_rel=config.sentinel_dir or f"sentinel/sentinel_{config.name}",
-        dem_rel=config.dem_file or f"DEM/{config.name}.tif",
-        gcp_json_rel=config.gcp_json,  # None if no GCP tile was downloaded
-        gcp_chip_rel=config.gcp_chip_dir or f"gcp/{config.name}/L1C_chips",
-        us_national_ortho_rel=config.us_national_ortho,
-    ))
 
 
 def _find_phisat_image(config: SceneConfig) -> None:
