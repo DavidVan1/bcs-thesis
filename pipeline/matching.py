@@ -95,68 +95,63 @@ def ransac_filter(kp0: np.ndarray, kp1: np.ndarray,
 
 # ── Match visualizer ──────────────────────────────────────────────────
 
-class MatchVisualizer:
-    """Side-by-side match visualisation (PhiSat rescaled to Sentinel height)."""
+def visualize_matches(image0: np.ndarray, image1: np.ndarray,
+                     keypoints0: np.ndarray, keypoints1: np.ndarray,
+                     output_path: str, max_matches: int = 100) -> None:
+    """Save side-by-side match visualisation (PhiSat rescaled to Sentinel height)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-    @staticmethod
-    def visualize(image0: np.ndarray, image1: np.ndarray,
-                  keypoints0: np.ndarray, keypoints1: np.ndarray,
-                  output_path: str, max_matches: int = 100) -> None:
-        """Save match visualisation to *output_path*."""
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+    total = len(keypoints0)
+    if total == 0:
+        logger.info("  No matches to visualise.")
+        return
 
-        total = len(keypoints0)
-        if total == 0:
-            logger.info("  No matches to visualise.")
-            return
+    if total > max_matches:
+        idx = np.random.choice(total, max_matches, replace=False)
+        vis0, vis1 = keypoints0[idx], keypoints1[idx]
+    else:
+        vis0, vis1 = keypoints0, keypoints1
 
-        if total > max_matches:
-            idx = np.random.choice(total, max_matches, replace=False)
-            vis0, vis1 = keypoints0[idx], keypoints1[idx]
-        else:
-            vis0, vis1 = keypoints0, keypoints1
+    h0, w0 = image0.shape[:2]
+    h1, w1 = image1.shape[:2]
+    scale = h1 / h0
+    new_w0, new_h0 = int(w0 * scale), h1
 
-        h0, w0 = image0.shape[:2]
-        h1, w1 = image1.shape[:2]
-        scale = h1 / h0
-        new_w0, new_h0 = int(w0 * scale), h1
+    img0_r = cv2.resize(image0, (new_w0, new_h0),
+                         interpolation=cv2.INTER_LINEAR)
+    vis0_s = vis0 * scale
 
-        img0_r = cv2.resize(image0, (new_w0, new_h0),
-                             interpolation=cv2.INTER_LINEAR)
-        vis0_s = vis0 * scale
+    canvas = np.zeros((h1, new_w0 + w1, 3), dtype=np.uint8)
+    canvas[:new_h0, :new_w0] = img0_r
+    canvas[:h1, new_w0:] = image1
 
-        canvas = np.zeros((h1, new_w0 + w1, 3), dtype=np.uint8)
-        canvas[:new_h0, :new_w0] = img0_r
-        canvas[:h1, new_w0:] = image1
+    fig_w = 16
+    fig_h = fig_w * h1 / (new_w0 + w1)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.imshow(canvas)
 
-        fig_w = 16
-        fig_h = fig_w * h1 / (new_w0 + w1)
-        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-        ax.imshow(canvas)
+    c = (144 / 255, 238 / 255, 144 / 255)
 
-        c = (144 / 255, 238 / 255, 144 / 255)
-        
-        # Labels at top
-        ax.text(20, 40, f"PhiSat-2  {total} matches",
-                fontsize=14, color="yellow", ha='left', va='top')
-        ax.text(new_w0 + 20, 40, "Sentinel-2",
-                fontsize=14, color="yellow", ha='left', va='top')
-        
-        for (x0, y0), (x1, y1) in zip(vis0_s, vis1):
-            ax.plot([x0, x1 + new_w0], [y0, y1],
-                    color=c, linewidth=0.8, alpha=0.6)
-            ax.scatter(x0, y0, c=[c], s=15, edgecolors="none")
-            ax.scatter(x1 + new_w0, y1, c=[c], s=15, edgecolors="none")
+    ax.text(20, 40, f"PhiSat-2  {total} matches",
+            fontsize=14, color="yellow", ha='left', va='top')
+    ax.text(new_w0 + 20, 40, "Sentinel-2",
+            fontsize=14, color="yellow", ha='left', va='top')
 
-        ax.axis("off")
-        plt.tight_layout()
+    for (x0, y0), (x1, y1) in zip(vis0_s, vis1):
+        ax.plot([x0, x1 + new_w0], [y0, y1],
+                color=c, linewidth=0.8, alpha=0.6)
+        ax.scatter(x0, y0, c=[c], s=15, edgecolors="none")
+        ax.scatter(x1 + new_w0, y1, c=[c], s=15, edgecolors="none")
 
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        logger.info("  Saved match visualisation → %s", output_path)
+    ax.axis("off")
+    plt.tight_layout()
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("  Saved match visualisation → %s", output_path)
 
 
 # ── Full matching pipeline ─────────────────────────────────────────────
@@ -189,6 +184,8 @@ def run_matching(config: SceneConfig,
     logger.info("=" * 60)
     logger.info("MATCHING — scene '%s'  matcher=%s", config.name, matcher_name)
     logger.info("=" * 60)
+
+    config.ensure_output_dir()
 
     # 1. Load images
     phisat_img, phisat_ds = load_satellite_image(str(config.phisat_image_path))
@@ -237,7 +234,7 @@ def run_matching(config: SceneConfig,
 
     # 6. Visualise matches  (include matcher name in filename)
     viz_path = config.output_dir / f"matches_{matcher_name}.png"
-    MatchVisualizer.visualize(phi_enh, sen_enh, kp0, kp1, str(viz_path))
+    visualize_matches(phi_enh, sen_enh, kp0, kp1, str(viz_path))
 
     # 7. Geo-coordinates
     tie_points: List[Dict] = []
