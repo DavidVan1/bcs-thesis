@@ -35,11 +35,9 @@ import cv2
 import logging
 import numpy as np
 import torch
-import torchvision.transforms.functional as TF
 
-# ── Paths into third_party/ ──────────────────────────────────────────────
+# ── Paths into third_party/ ────────────────────────────────────────────
 _TP = Path(__file__).resolve().parent.parent / "third_party"
-_HLOC = _TP / "hloc"
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +104,15 @@ def _resize_divisible(img: np.ndarray, max_side: int, dfactor: int,
 def _rescale_keypoints(kp: np.ndarray, scale: np.ndarray) -> np.ndarray:
     """Scale keypoints from resized coordinates back to original."""
     return kp * scale[np.newaxis, :]
+
+
+def _empty() -> Dict[str, np.ndarray]:
+    """Return an empty match result."""
+    return {
+        "keypoints0": np.empty((0, 2)),
+        "keypoints1": np.empty((0, 2)),
+        "confidence": np.empty(0),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -521,11 +528,3 @@ def get_matcher(name: str, *,
             f"Available: {', '.join(_REGISTRY)}"
         )
     return _REGISTRY[key](device=device, max_keypoints=max_keypoints)
-
-
-# ── tiny helper ──────────────────────────────────────────────────────────
-
-def _empty() -> Dict[str, np.ndarray]:
-    return {"keypoints0": np.empty((0, 2)),
-            "keypoints1": np.empty((0, 2)),
-            "confidence": np.empty(0)}
