@@ -12,6 +12,8 @@ import numpy as np
 import cv2
 import rasterio
 
+from .config import DEFAULT_FOCAL_LENGTH, DEFAULT_PRINCIPAL_POINT
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,9 +72,9 @@ def load_calibration(json_path: str) -> Dict:
     pose = data.get("pose", {})
 
     return {
-        "f": cam.get("f", 105790.0),
-        "cx": cam.get("cx", 2048.0),
-        "cy": cam.get("cy", 2048.0),
+        "f": cam.get("f", DEFAULT_FOCAL_LENGTH),
+        "cx": cam.get("cx", DEFAULT_PRINCIPAL_POINT),
+        "cy": cam.get("cy", DEFAULT_PRINCIPAL_POINT),
         "k1": cam.get("k1", 0.0),
         "k2": cam.get("k2", 0.0),
         "cx_rate": cam.get("cx_rate", 0.0),

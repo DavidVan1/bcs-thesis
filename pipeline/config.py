@@ -12,7 +12,14 @@ from typing import Optional, List
 
 
 # ── Project root (one level above pipeline/) ────────────────────────────
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
+
+# ── Camera / sensor defaults ────────────────────────────────────────────
+DEFAULT_FOCAL_LENGTH: float = 105790.0   # pixels
+DEFAULT_PRINCIPAL_POINT: float = 2048.0  # cx = cy = image centre
+DEFAULT_MARGIN_PIXELS: int = 512
+DEFAULT_MAX_KEYPOINTS: int = 2048
+PHISAT_GSD_M: float = 4.75              # ground sample distance (metres)
 
 
 @dataclass
@@ -32,33 +39,33 @@ class SceneConfig:
     sentinel_band: str = "TCI"
 
     # Optional independent reference imagery (e.g. USDA NAIP for US scenes)
-    us_national_ortho: Optional[str] = None  # e.g. "national/us_sf/us_naip_2019_2023.tif"
+    us_national_ortho: Optional[str] = None
 
     # Tie points
-    tie_points_csv: Optional[str] = None  # e.g. "outputs/tie_points_lightglue_sf8.csv"
+    tie_points_csv: Optional[str] = None
 
     # DEM
-    dem_file: Optional[str] = None        # e.g. "DEM/sf3.tif"
+    dem_file: Optional[str] = None
 
     # Calibration
-    calib_json: Optional[str] = None      # e.g. "outputs/phisat_model_robust_sf.json"
+    calib_json: Optional[str] = None
 
     # GCP verification
-    gcp_json: Optional[str] = None        # e.g. "gcp/sf/N37W123.json"
-    gcp_chip_dir: Optional[str] = None    # e.g. "gcp/sf/L1C_chips"
+    gcp_json: Optional[str] = None
+    gcp_chip_dir: Optional[str] = None
 
     # Outputs  (all stored under outputs/<name>/)
-    ortho_tif: Optional[str] = None       # e.g. "outputs/sf/phisat_ortho.tif"
+    ortho_tif: Optional[str] = None
     verification_json: Optional[str] = None  # set by set_matcher()
 
     # Camera defaults
-    initial_f: float = 105790.0
-    cx: float = 2048.0
-    cy: float = 2048.0
+    initial_f: float = DEFAULT_FOCAL_LENGTH
+    cx: float = DEFAULT_PRINCIPAL_POINT
+    cy: float = DEFAULT_PRINCIPAL_POINT
 
     # Matching
-    margin_pixels: int = 512
-    max_keypoints: int = 2048
+    margin_pixels: int = DEFAULT_MARGIN_PIXELS
+    max_keypoints: int = DEFAULT_MAX_KEYPOINTS
 
     # ── Resolved absolute paths ──────────────────────────────────────
 
@@ -127,7 +134,11 @@ class SceneConfig:
     @property
     def output_dir(self) -> Path:
         """All pipeline outputs go here: outputs/<scene_name>/"""
-        d = self.root / "outputs" / self.name
+        return self.root / "outputs" / self.name
+
+    def ensure_output_dir(self) -> Path:
+        """Create and return the output directory."""
+        d = self.output_dir
         d.mkdir(parents=True, exist_ok=True)
         return d
 

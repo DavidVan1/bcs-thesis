@@ -17,9 +17,6 @@ report RMSE / mean error in metres and PhiSat-2 pixels (4.75 m).
 """
 
 import logging
-import warnings
-warnings.filterwarnings("ignore")
-
 import json
 import numpy as np
 from pathlib import Path
@@ -37,10 +34,10 @@ try:
 except ImportError:
     HAS_CV2 = False
 
-from .config import SceneConfig
+from .config import SceneConfig, PHISAT_GSD_M
 
-# PhiSat-2 GSD (metres)
-PIXEL_SIZE = 4.75
+# PhiSat-2 GSD (metres) — re-exported for local use
+PIXEL_SIZE: float = PHISAT_GSD_M
 logger = logging.getLogger(__name__)
 
 

@@ -6,16 +6,20 @@ End-to-end pipeline for orthorectifying PhiSat-2 pushbroom satellite
 imagery using Sentinel-2 tie points, DEM elevation, and independent
 GCP verification.
 
-Modules:
-    config          – Scene definitions and project paths
-    utils           – Image I/O, enhancement, tie-point loading
-    sensor_model    – Pushbroom geometric model (forward + inverse)
-    matchers        – Pluggable feature matchers (LightGlue, XoFTR, …)
-    matching        – Feature matching pipeline with Sentinel-2
-    calibration     – Robust 3-phase sensor calibration
-    orthorectify    – DEM-aware orthorectification engine
-    verify          – Independent GCP verification via cross-correlation
-    run             – CLI entry point to run the full pipeline
+Modules
+-------
+config          Scene definitions, project paths, and shared constants
+utils           Image I/O, enhancement, tie-point loading
+sensor_model    Pushbroom geometric model (forward + inverse)
+matchers        Pluggable feature matchers (LightGlue, XoFTR, ...)
+matching        Feature matching pipeline with Sentinel-2
+calibration     Robust 3-phase sensor calibration
+orthorectify    DEM-aware orthorectification engine
+verify          Independent GCP verification via cross-correlation
+run             CLI entry point and pipeline orchestrator
+
+Pipeline stages (in order):
+    fetch -> match -> calibrate -> orthorectify -> verify
 """
 
 from .config import SceneConfig, get_scene_config, list_scenes

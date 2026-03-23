@@ -9,9 +9,6 @@ Pipeline:
   5. Write orthorectified GeoTIFF.
 """
 
-import warnings
-warnings.filterwarnings("ignore")
-
 import logging
 import numpy as np
 import json
@@ -33,11 +30,20 @@ except ImportError:
     HAS_CV2 = False
     from scipy.ndimage import map_coordinates
 
-from .config import SceneConfig
+from .config import SceneConfig, PHISAT_GSD_M
 from .sensor_model import PhiSatPushbroomModel, R_EARTH, create_model
 from .utils import load_calibration
 
 logger = logging.getLogger(__name__)
+
+
+# ── Constants ────────────────────────────────────────────────────────────
+TARGET_GSD_M: float = PHISAT_GSD_M     # output ground sample distance
+FOOTPRINT_MARGIN_DEG: float = 0.02     # degrees padding around footprint
+NEWTON_MAX_ITER: int = 20
+NEWTON_TOLERANCE_M: float = 1.0        # metres
+LUT_MIN_STEP: int = 10
+LUT_GRID_DIVISOR: int = 100             # max(dim) // this = step
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -77,6 +83,12 @@ class OrthorectificationEngine:
         logger.info("PhiSat shape   : %s", self.phisat_shape)
 
         self._apply_calibration()
+
+    def __enter__(self) -> "OrthorectificationEngine":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     # ── calibration ─────────────────────────────────────────────────
 
@@ -215,7 +227,8 @@ class OrthorectificationEngine:
 
     def _newton(self, ground_ecef: np.ndarray,
                 v_hint: Optional[float] = None,
-                max_iter: int = 20, tol: float = 1.0
+                max_iter: int = NEWTON_MAX_ITER,
+                tol: float = NEWTON_TOLERANCE_M,
                 ) -> Optional[Tuple[float, float]]:
         """Newton–Raphson back-projection."""
 
@@ -321,7 +334,7 @@ class OrthorectificationEngine:
             logger.error("  ERROR: cannot compute footprint")
             return None
 
-        margin = 0.02
+        margin = FOOTPRINT_MARGIN_DEG
         fp_w, fp_e = min(lons) - margin, max(lons) + margin
         fp_s, fp_n = min(lats) - margin, max(lats) + margin
 
@@ -335,8 +348,8 @@ class OrthorectificationEngine:
             logger.error("  ERROR: footprint outside DEM")
             return None
 
-        # Target output grid in local UTM (metric) with square 4.75 m pixels.
-        target_gsd_m = 4.75
+        # Target output grid in local UTM (metric) with square pixels.
+        target_gsd_m = TARGET_GSD_M
         lon_c = 0.5 * (o_w + o_e)
         lat_c = 0.5 * (o_s + o_n)
         out_crs = CRS.from_epsg(_utm_epsg_from_lonlat(lon_c, lat_c))
@@ -367,7 +380,7 @@ class OrthorectificationEngine:
 
         # Step 2: Sparse LUT
         logger.info("\n[2] Building sparse LUT...")
-        lut_step = max(10, max(out_h, out_w) // 100)
+        lut_step = max(LUT_MIN_STEP, max(out_h, out_w) // LUT_GRID_DIVISOR)
         rows_lut = np.arange(0, out_h, lut_step, dtype=int)
         cols_lut = np.arange(0, out_w, lut_step, dtype=int)
         if rows_lut[-1] != out_h - 1:
@@ -515,22 +528,19 @@ def run_orthorectify(config: SceneConfig) -> Optional[str]:
     model = create_model(config)
     calib = load_calibration(str(config.calib_path))
 
-    engine = OrthorectificationEngine(
+    with OrthorectificationEngine(
         model,
         str(config.dem_path),
         str(config.phisat_image_path),
         calib,
-    )
+    ) as engine:
+        result = engine.orthorectify()
+        if result is None:
+            return None
 
-    result = engine.orthorectify()
-    if result is None:
-        engine.close()
-        return None
-
-    ortho_data, transform, crs = result
-    out = str(config.ortho_path)
-    engine.write_geotiff(ortho_data, transform, crs, out)
-    engine.close()
+        ortho_data, transform, crs = result
+        out = str(config.ortho_path)
+        engine.write_geotiff(ortho_data, transform, crs, out)
 
     logger.info("Orthorectification complete → %s", out)
     return out

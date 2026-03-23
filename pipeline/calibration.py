@@ -5,8 +5,9 @@ Phase 1 – Soft-L1 robust optimisation (tolerant to outliers)
 Phase 2 – 3-σ outlier removal
 Phase 3 – Final linear least-squares refinement on clean inliers
 
-Parameter vector (9):
-    [time_shift, roll, pitch, yaw, f_scale, k1, k2, cx_rate, along_rate]
+Parameter vector (12):
+    [time_shift, roll, pitch, yaw, f_scale, k1, k2, cx_rate, along_rate,
+     roll_rate, pitch_rate, yaw_rate]
 """
 
 import json
@@ -24,6 +25,33 @@ from .utils import load_tie_points, save_calibration
 logger = logging.getLogger(__name__)
 
 
+# ── Calibration parameter definition ─────────────────────────────────────
+
+PARAM_NAMES: List[str] = [
+    "time_shift", "roll", "pitch", "yaw", "f_scale",
+    "k1", "k2", "cx_rate", "along_rate",
+    "roll_rate", "pitch_rate", "yaw_rate",
+]
+
+PARAM_INITIAL: List[float] = [
+    0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+]
+
+PARAM_LOWER: List[float] = [
+    -60., -5., -5., -5., 0.8, -1e-8, -1e-8,
+    -0.25, -0.03, -0.8, -0.8, -0.8,
+]
+
+PARAM_UPPER: List[float] = [
+    60., 5., 5., 5., 1.2, 1e-8, 1e-8,
+    0.25, 0.03, 0.8, 0.8, 0.8,
+]
+
+OUTLIER_SIGMA: float = 3.0
+DRIFT_WARNING_THRESHOLD: float = 0.5  # degrees
+METRES_PER_DEGREE_LAT: float = 111_132.0
+
+
 # ── Residual function ──────────────────────────────────────────────────
 
 def _residuals(params: np.ndarray,
@@ -33,7 +61,7 @@ def _residuals(params: np.ndarray,
     Compute [lon_err_m, lat_err_m] for every tie point.
     Returns flat array of length 2·N.
     """
-    residuals = []
+    residuals: List[float] = []
     for tp in tie_points:
         pred_ecef = model.predict_with_params(
             tp["phisat_x"], tp["phisat_y"], params)
@@ -44,8 +72,8 @@ def _residuals(params: np.ndarray,
 
         pred_lon, pred_lat, _ = model.ecef_to_lonlat(*pred_ecef)
 
-        lat_res_m = (pred_lat - tp["lat"]) * 111_132.0
-        lon_scale = 111_132.0 * np.cos(np.radians(tp["lat"]))
+        lat_res_m = (pred_lat - tp["lat"]) * METRES_PER_DEGREE_LAT
+        lon_scale = METRES_PER_DEGREE_LAT * np.cos(np.radians(tp["lat"]))
         lon_res_m = (pred_lon - tp["lon"]) * lon_scale
 
         residuals.append(lon_res_m)
@@ -82,13 +110,10 @@ def run_calibration(config: SceneConfig,
     all_points = load_tie_points(str(config.tie_points_path))
     logger.info("Loaded %d tie points.", len(all_points))
 
-    # Bounds: [t_shift, roll, pitch, yaw, f_scale, k1, k2, cx_rate, along_rate,
-    #          roll_rate, pitch_rate, yaw_rate]
-    x0    = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,  0.0,  0.0,  0.0]
-    lower = [-60., -5., -5., -5., 0.8, -1e-8, -1e-8,
-             -0.25, -0.03, -0.8, -0.8, -0.8]
-    upper = [ 60.,  5.,  5.,  5., 1.2,  1e-8,  1e-8,
-              0.25,  0.03,  0.8,  0.8,  0.8]
+    # Bounds
+    x0 = list(PARAM_INITIAL)
+    lower = list(PARAM_LOWER)
+    upper = list(PARAM_UPPER)
 
     # ── Phase 1: Robust (Soft L1) ──
     logger.info("\n--- Phase 1: Robust Optimisation (Soft L1) ---")
@@ -100,13 +125,13 @@ def run_calibration(config: SceneConfig,
     )
 
     # ── Phase 2: 3-σ outlier removal ──
-    logger.info("\n--- Phase 2: Outlier Filtering (3-σ) ---")
+    logger.info("\n--- Phase 2: Outlier Filtering (%d-σ) ---", OUTLIER_SIGMA)
     res_vec = _residuals(res1.x, model, all_points).reshape(-1, 2)
     distances = np.linalg.norm(res_vec, axis=1)
 
     mean_err = np.mean(distances)
     std_err = np.std(distances)
-    threshold = mean_err + 3 * std_err
+    threshold = mean_err + OUTLIER_SIGMA * std_err
 
     logger.info(
         "Mean: %.1f m  Std: %.1f m  Threshold: %.1f m",
@@ -149,20 +174,18 @@ def run_calibration(config: SceneConfig,
 
     # Warn if any rate param is large — suggests real attitude drift
     drift_mag = np.hypot(p[9], np.hypot(p[10], p[11]))
-    if drift_mag > 0.5:
+    if drift_mag > DRIFT_WARNING_THRESHOLD:
         logger.warning(
-            f"Large attitude drift detected ({drift_mag:.3f}°). "
-            f"Consider checking AOCS data quality.")
+            "Large attitude drift detected (%.3f°). "
+            "Consider checking AOCS data quality.", drift_mag)
 
     # Warn if solution hit a bound
     for i, (val, lo, hi) in enumerate(zip(p, lower, upper)):
         if abs(val - lo) < 1e-6 or abs(val - hi) < 1e-6:
-            names = ['time_shift','roll','pitch','yaw','f_scale',
-                     'k1','k2','cx_rate','along_rate',
-                     'roll_rate','pitch_rate','yaw_rate']
             logger.warning(
-                f"Parameter '{names[i]}' hit bound ({val:.6f}). "
-                f"Model may be under-constrained.")
+                "Parameter '%s' hit bound (%.6f). "
+                "Model may be under-constrained.",
+                PARAM_NAMES[i], val)
 
     calib = {
         "f": refined_f,
