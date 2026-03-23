@@ -300,7 +300,9 @@ def _intersect_sphere(origin: np.ndarray, direction: np.ndarray,
 # Model factory (convenience for other modules)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def create_model(config, model_class=PhiSatPushbroomModel) -> PhiSatPushbroomModel:
+def create_model(config: "SceneConfig",
+                 model_class: type = PhiSatPushbroomModel,
+                 ) -> PhiSatPushbroomModel:
     """
     Instantiate a sensor model from a SceneConfig, load AOCS + timing.
 
@@ -321,7 +323,8 @@ def create_model(config, model_class=PhiSatPushbroomModel) -> PhiSatPushbroomMod
         cy=config.cy,
     )
 
-    # Timing from metadata
+    # Load timing from metadata once
+    timing = None
     if config.metadata_path and config.metadata_path.exists():
         timing = load_metadata_timing(str(config.metadata_path))
         if timing:
@@ -331,14 +334,12 @@ def create_model(config, model_class=PhiSatPushbroomModel) -> PhiSatPushbroomMod
     # AOCS
     model.load_aocs_metadata(str(config.aocs_path))
 
-    # Along-shift from metadata
-    if config.metadata_path and config.metadata_path.exists():
-        timing = load_metadata_timing(str(config.metadata_path))
-        if timing and model.t0 is not None:
-            shift = (timing["image_start_utc"]
-                     - model.t0
-                     - (0 - model.cy) * model.line_time)
-            model.along_shift = shift
-            logger.info("Calculated along_shift: %.3f s", shift)
+    # Along-shift from metadata (reuse already-loaded timing)
+    if timing and model.t0 is not None:
+        shift = (timing["image_start_utc"]
+                 - model.t0
+                 - (0 - model.cy) * model.line_time)
+        model.along_shift = shift
+        logger.info("Calculated along_shift: %.3f s", shift)
 
     return model
