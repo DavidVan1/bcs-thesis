@@ -120,9 +120,9 @@ def _adaptive_fetch_margin(
     lon_min: float, lat_min: float,
     lon_max: float, lat_max: float,
     *,
-    ratio: float = 0.10,
+    ratio: float = 0.06,
     min_deg: float = 0.01,
-    max_deg: float = 0.05,
+    max_deg: float = 0.03,
 ) -> float:
     """
     Compute a scene-size-aware margin (degrees) for fetch-time AOIs.
@@ -193,7 +193,9 @@ def download_sentinel(
     *,
     date_window_days: int = 90,
     max_cloud_pct: float = 5.0,
+    min_coverage: float = 0.70,
     scale_m: float = 10.0,
+    region_buffer_m: float = 5000.0,
 ) -> Path:
     """
     Download the least-cloudy Sentinel-2 TCI (True Colour Image) covering
@@ -202,9 +204,10 @@ def download_sentinel(
     Output: 3-band uint8 GeoTIFF (R=B4, G=B3, B=B2) equivalent to the
     official ESA TCI product — directly usable by the feature matcher.
 
-    Cloud selection uses S2_SR_HARMONIZED (has SCL band) to compute the
-    actual cloud fraction inside the footprint.  The TCI mosaic is then
-    built from S2_HARMONIZED (L1C) for the same date.
+        Selection strategy is intentionally simple and robust for reference use:
+            1) search by scene center point (like manual EE inspection)
+            2) rank by low cloud and AOI valid coverage
+            3) export selected image clipped to AOI
     """
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -224,126 +227,104 @@ def download_sentinel(
         "[%.4f,%.4f] x [%.4f,%.4f]",
         lon_min, lon_max, lat_min, lat_max)
 
-    region = ee.Geometry.Rectangle([lon_min, lat_min, lon_max, lat_max])
+    aoi = ee.Geometry.Rectangle([lon_min, lat_min, lon_max, lat_max])
+    region = aoi.buffer(region_buffer_m).bounds() if region_buffer_m > 0 else aoi
 
-    def _best_date(start: str, end: str, cloud_limit: float,
-                   min_coverage: float = 0.80):
-        """
-        Find the date with the lowest cloud fraction AND sufficient spatial
-        coverage of the ROI.
+    logger.info(
+        "  Sentinel AOI + Buffer : [%.4f,%.4f] x [%.4f,%.4f]",
+        lon_min, lon_max, lat_min, lat_max,
+    )
+    logger.info("  Sentinel buffer      : %.0f m", region_buffer_m)
 
-        For each candidate date the per-granule SCL cloud fraction is scored
-        *and* the mosaic's valid-pixel coverage over the ROI is checked.
-        Dates where coverage < *min_coverage* are discarded, then the date
-        with the lowest cloud fraction is returned.
-
-        Uses S2_SR_HARMONIZED (has SCL band) for scoring.
-        Returns (date_str, cloud_frac) or (None, None).
-        """
-        sr_col = (
+    def _find_best_image(start: str, end: str, cloud_limit: float):
+        collection = (
             ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
             .filterBounds(region)
             .filterDate(start, end)
-            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE",
-                                  min(cloud_limit * 3, 100)))
+            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_limit))
+            .sort("CLOUDY_PIXEL_PERCENTAGE")
         )
-        size = sr_col.size().getInfo()
-        if size == 0:
-            return None, None
 
-        logger.info("    %d granule(s) in window — scoring ROI cloud + coverage ...", size)
+        if collection.size().getInfo() == 0:
+            return None
 
-        # ── per-granule cloud scoring ──
-        def add_date_cloud(img):
-            date_str = ee.Date(img.get("system:time_start")).format("YYYY-MM-dd")
-            scl = img.select("SCL")
-            cloud_mask = scl.eq(3).Or(scl.eq(8)).Or(scl.eq(9)).Or(scl.eq(10))
-            stats = cloud_mask.reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=region, scale=60, maxPixels=1e7, bestEffort=True,
-            )
-            frac = ee.Number(stats.get("SCL")).multiply(100)
-            return img.set("DATE_DAY", date_str).set("CLOUD_ROI", frac)
+        candidates = collection.limit(120)
+        times = candidates.aggregate_array("system:time_start").getInfo() or []
 
-        scored = sr_col.map(add_date_cloud)
-        dates_list = scored.aggregate_array("DATE_DAY").getInfo()
-        fracs_list = scored.aggregate_array("CLOUD_ROI").getInfo()
-        if not dates_list:
-            return None, None
+        for ts in times:
+            image = ee.Image(collection.filter(ee.Filter.eq("system:time_start", ts)).first())
+            date_str = ee.Date(ts).format("YYYY-MM-dd").getInfo()
 
-        from collections import defaultdict
-        date_fracs: dict = defaultdict(list)
-        for d, f in zip(dates_list, fracs_list):
-            if f is not None:
-                date_fracs[d].append(f)
-
-        # ── rank candidates: lowest cloud first ──
-        candidates = sorted(date_fracs.keys(),
-                            key=lambda d: sum(date_fracs[d]) / len(date_fracs[d]))
-
-        # ── check spatial coverage for top candidates ──
-        for date_str in candidates:
-            frac = sum(date_fracs[date_str]) / len(date_fracs[date_str])
-            if frac >= cloud_limit:
-                break  # remaining are worse — give up
-
-            next_day = (datetime.datetime.strptime(date_str, "%Y-%m-%d")
-                        + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-            day_mosaic = (
-                sr_col.filterDate(date_str, next_day)
-                .select("B4").mosaic()       # any band will do
-            )
-            # fraction of ROI pixels that have valid (non-null) data
-            valid_mask = day_mosaic.mask()    # 1 where data, 0 where masked
+            # AOI data coverage from valid-mask fraction over B4.
+            valid_mask = image.select("B4").mask()
             cov_stat = valid_mask.reduceRegion(
                 reducer=ee.Reducer.mean(),
-                geometry=region, scale=60, maxPixels=1e7, bestEffort=True,
+                geometry=region,
+                scale=60,
+                maxPixels=1e7,
+                bestEffort=True,
             )
-            coverage = ee.Number(cov_stat.get("B4")).getInfo()
-            if coverage is None:
-                coverage = 0.0
-            n_gran = len(date_fracs[date_str])
-            logger.info("    %s  cloud %5.2f%%  coverage %5.1f%%  (%d granule(s))",
-                        date_str, frac, coverage * 100, n_gran)
+            coverage = cov_stat.get("B4").getInfo()
+            coverage = float(coverage) if coverage is not None else 0.0
+
+            cloud = float(image.get("CLOUDY_PIXEL_PERCENTAGE").getInfo() or 0.0)
+            logger.info(
+                "    %s cloud %5.2f%% coverage %5.1f%%",
+                date_str,
+                cloud,
+                coverage * 100,
+            )
 
             if coverage >= min_coverage:
-                return date_str, frac
+                return image
 
-        logger.info(
-            "    No date with cloud < %.0f%% and coverage >= %.0f%%",
-            cloud_limit, min_coverage * 100)
-        return None, None
+        return None
+
+    import datetime
+    best_image = None
 
     # ── pass 1: around acquisition date ───────────────────────────
-    import datetime
-    best_date = cloud_frac = None
     if acq_date:
         dt = datetime.datetime.strptime(acq_date, "%Y-%m-%d")
         td = datetime.timedelta(days=date_window_days)
         start = (dt - td).strftime("%Y-%m-%d")
         end   = (dt + td).strftime("%Y-%m-%d")
-        logger.info("  Pass 1 — %s -> %s  (ROI cloud <= %.0f%%)", start, end, max_cloud_pct)
-        best_date, cloud_frac = _best_date(start, end, max_cloud_pct)
+        logger.info("  Pass 1 — %s -> %s (cloud <= %.0f%%)", start, end, max_cloud_pct)
+        best_image = _find_best_image(start, end, max_cloud_pct)
 
     # ── pass 2: full archive ───────────────────────────────────────
-    if best_date is None:
-        logger.info("  Pass 2 — full archive  (ROI cloud <= %.0f%%)", max_cloud_pct)
-        best_date, cloud_frac = _best_date("2015-01-01", "2099-01-01", max_cloud_pct)
+    if best_image is None:
+        logger.info("  Pass 2 — full archive (cloud <= %.0f%%)", max_cloud_pct)
+        best_image = _find_best_image("2015-01-01", "2099-01-01", max_cloud_pct)
 
     # ── pass 3: relaxed cloud ──────────────────────────────────────
-    if best_date is None:
+    if best_image is None:
         logger.info("  Pass 3 — full archive, cloud <= 30%%")
-        best_date, cloud_frac = _best_date("2015-01-01", "2099-01-01", 30.0)
+        best_image = _find_best_image("2015-01-01", "2099-01-01", 30.0)
 
     # ── pass 4: no cloud filter ────────────────────────────────────
-    if best_date is None:
-        logger.info("  Pass 4 — full archive, no cloud filter")
-        best_date, cloud_frac = _best_date("2015-01-01", "2099-01-01", 100.0)
-        if best_date is None:
-            raise RuntimeError("No Sentinel-2 images found for the given footprint.")
+    if best_image is None:
+        logger.info("  Pass 4 — full archive, no cloud filter (coverage >= %.0f%%)", min_coverage * 100)
+        best_image = _find_best_image("2015-01-01", "2099-01-01", 100.0)
+    # Last resort: allow lower coverage rather than failing hard.
+    if best_image is None and min_coverage > 0.50:
+        relaxed = 0.50
+        logger.warning(
+            "  No candidate met %.0f%% coverage; retrying with %.0f%%",
+            min_coverage * 100,
+            relaxed * 100,
+        )
+        min_coverage = relaxed
+        best_image = _find_best_image("2015-01-01", "2099-01-01", 100.0)
+
+    if best_image is None:
+        raise RuntimeError("No Sentinel-2 images found for the given footprint.")
+
+    best_date = ee.Date(best_image.get("system:time_start")).format("YYYY-MM-dd").getInfo()
+    cloud_frac = float(best_image.get("CLOUDY_PIXEL_PERCENTAGE").getInfo() or 0.0)
 
     logger.info("  Selected date       : %s", best_date)
-    logger.info("  Cloud (footprint)   : %.2f%%", cloud_frac)
+    logger.info("  Cloud (scene-level) : %.2f%%", cloud_frac)
 
     out_tif = out_dir / f"sentinel_TCI_{best_date}.tif"
 
@@ -351,35 +332,21 @@ def download_sentinel(
         logger.info("  Already exists — skipping download: %s", out_tif.name)
         return out_tif
 
-    # Build TCI mosaic from L1C (S2_HARMONIZED) on the best date.
-    # S2_HARMONIZED starts from 2017; for earlier dates fall back to
-    # using the SR collection (B4/B3/B2 are also present there).
-    next_day = (datetime.datetime.strptime(best_date, "%Y-%m-%d")
-                + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    native_crs = best_image.select("B4").projection().crs().getInfo()
+    export_crs = "EPSG:4326"
 
-    def _tci_col(collection_id: str) -> "ee.ImageCollection":
-        return (
-            ee.ImageCollection(collection_id)
-            .filterBounds(region)
-            .filterDate(best_date, next_day)
-        )
-
-    l1c_day = _tci_col("COPERNICUS/S2_HARMONIZED")
-    if l1c_day.size().getInfo() == 0:
-        logger.warning("  L1C collection empty for %s — using SR collection for TCI", best_date)
-        l1c_day = _tci_col("COPERNICUS/S2_SR_HARMONIZED")
-
-    n_granules = l1c_day.size().getInfo()
-    logger.info("  Mosaicking %d granule(s) for %s", n_granules, best_date)
-    tci_mosaic = _make_tci(l1c_day.mosaic()).clip(region)
-    gd_img = BaseImage(tci_mosaic)
+    logger.info("  Using AOI-selected image for %s", best_date)
+    logger.info("  Sentinel source CRS  : %s", native_crs)
+    logger.info("  Sentinel export CRS  : %s", export_crs)
+    tci_image = _make_tci(best_image)
+    gd_img = BaseImage(tci_image)
 
     logger.info("  Downloading TCI to %s ...", out_tif)
     gd_img.download(
         str(out_tif),
         region=region,
         scale=scale_m,
-        crs="EPSG:4326",
+        crs=native_crs,
         dtype="uint8",
         overwrite=True,
     )
@@ -397,6 +364,7 @@ def download_dem(
     output_path: Path,
     *,
     scale_m: float = 30.0,
+    region_buffer_m: float = 15000.0,
 ) -> Path:
     """
     Download Copernicus GLO-30 DEM for the footprint from Google Earth Engine.
@@ -417,7 +385,9 @@ def download_dem(
         logger.info("  Already exists — skipping download: %s", output_path.name)
         return output_path
 
-    region = ee.Geometry.Rectangle([lon_min, lat_min, lon_max, lat_max])
+    aoi = ee.Geometry.Rectangle([lon_min, lat_min, lon_max, lat_max])
+    region = aoi.buffer(region_buffer_m).bounds() if region_buffer_m > 0 else aoi
+    logger.info("  DEM buffer          : %.0f m", region_buffer_m)
 
     dem = (
         ee.ImageCollection("COPERNICUS/DEM/GLO30")
@@ -739,8 +709,8 @@ def run_fetch(config: SceneConfig, *,
         "  Raw footprint : lon [%.4f, %.4f]  lat [%.4f, %.4f]",
         lon_min, lon_max, lat_min, lat_max)
 
-    # Add a small adaptive margin for Sentinel-2 and DEM.
-    # A fixed 0.15° margin can over-expand compact scenes and slow S2 scoring.
+    # Keep fetch AOI modest for stable reference-image selection.
+    # Matching margin is handled later during reprojection, not during fetch.
     fetch_margin = _adaptive_fetch_margin(lon_min, lat_min, lon_max, lat_max)
     logger.info("  Fetch margin   : %.4f°", fetch_margin)
     s_lon_min, s_lat_min, s_lon_max, s_lat_max = _expand_bbox(
@@ -847,12 +817,8 @@ def run_fetch(config: SceneConfig, *,
         scene_entry["us_national_ortho"] = config.us_national_ortho
     scene_entry["initial_f"] = config.initial_f
 
-    import json as _json
-    logger.info(
-        "\nAdd the following to pipeline/scenes.json:\n"
-        '  "%s": %s', config.name,
-        _json.dumps(scene_entry, indent=4),
-    )
+    scenes_json_path = PROJECT_ROOT / "pipeline" / "scenes.json"
+    _upsert_scene_in_json(scenes_json_path, config.name, scene_entry)
 
 
 def _find_phisat_image(config: SceneConfig) -> None:
@@ -887,3 +853,30 @@ def _find_phisat_image(config: SceneConfig) -> None:
         for p in config.phisat_dir_path.glob("session_*.json"):
             config.metadata_json = p.name
             break
+
+
+def _upsert_scene_in_json(scenes_json_path: Path, scene_name: str, scene_entry: dict) -> None:
+    """Insert or update a scene entry inside pipeline/scenes.json."""
+    scenes_json_path.parent.mkdir(parents=True, exist_ok=True)
+
+    current: dict = {}
+    if scenes_json_path.exists():
+        try:
+            with open(scenes_json_path) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                current = loaded
+            else:
+                logger.warning("  scenes.json root is not an object; starting from empty.")
+        except Exception as exc:
+            logger.warning("  Could not parse scenes.json (%s); starting from empty.", exc)
+
+    if scene_name not in current or not isinstance(current[scene_name], dict):
+        current[scene_name] = {}
+    current[scene_name].update(scene_entry)
+
+    with open(scenes_json_path, "w") as f:
+        json.dump(current, f, indent=2)
+        f.write("\n")
+
+    logger.info("  Updated scenes index: %s (%s)", scenes_json_path, scene_name)
