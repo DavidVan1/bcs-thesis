@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable, Dict, Optional, Sequence
 
 from .config import get_scene_config, list_scenes, SceneConfig
+from .profiler import PipelineProfile, profile_stage, _gpu_available
 
 logger = logging.getLogger(__name__)
 
@@ -51,15 +52,20 @@ PIPELINE_ORDER: Sequence[str] = (
 STAGE_CHOICES: Sequence[str] = ("all", *PIPELINE_ORDER)
 
 
+# Stages that typically use GPU acceleration
+_GPU_STAGES = {"match", "calibrate", "orthorectify"}
+
+
 @dataclass(frozen=True)
 class StageContext:
     """Runtime context passed to every stage runner."""
     config: SceneConfig
     matcher_name: str = "lightglue"
-    verify_method: str = "all"
+    verify_method: str = "ncc"
     reference_source: str = "sentinel"
     no_gcp_chips: bool = False
     fetch_us_mapping: bool = True
+    profile: bool = False
 
 
 # Type alias for a stage function:  (StageContext) -> None
@@ -111,7 +117,7 @@ def _run_orthorectify(ctx: StageContext) -> None:
 
 @register_stage("verify")
 def _run_verify(ctx: StageContext) -> None:
-    """Run GCP-based verification (position / NCC or both)."""
+    """Run NCC-based GCP verification."""
     from .verify import run_verification
     run_verification(ctx.config, method=ctx.verify_method,
                      reference_source=ctx.reference_source)
@@ -137,16 +143,42 @@ def run_pipeline(ctx: StageContext,
     logger.info("  Stages: %s", " → ".join(stages))
     logger.info("=" * 70 + "\n")
 
+    has_gpu = _gpu_available() if ctx.profile else False
+    pipeline_prof = PipelineProfile(
+        scene=ctx.config.name,
+        matcher=ctx.matcher_name,
+    ) if ctx.profile else None
+
     for name in stages:
         runner = _STAGE_REGISTRY.get(name)
         if runner is None:
             raise ValueError(f"Unknown stage '{name}'. "
                              f"Available: {', '.join(_STAGE_REGISTRY)}")
-        runner(ctx)
+
+        if ctx.profile:
+            use_gpu = has_gpu and name in _GPU_STAGES
+            with profile_stage(name, use_gpu=use_gpu) as prof:
+                runner(ctx)
+            pipeline_prof.stages.append(prof)
+            logger.info(
+                "   %s finished in %.2f s  |  RSS %.0f MB  |  CPU %.0f%%",
+                name, prof.wall_time_s, prof.peak_rss_mb, prof.cpu_percent,
+            )
+        else:
+            runner(ctx)
 
     logger.info("\n" + "=" * 70)
     logger.info("  PIPELINE COMPLETE")
     logger.info("=" * 70 + "\n")
+
+    if pipeline_prof is not None:
+        pipeline_prof.total_wall_time_s = sum(
+            s.wall_time_s for s in pipeline_prof.stages
+        )
+        logger.info("\n" + pipeline_prof.summary_table() + "\n")
+        out_dir = ctx.config.resolve(f"outputs/{ctx.config.name}")
+        if out_dir:
+            pipeline_prof.save(out_dir / "resource_profile.json")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -228,9 +260,9 @@ def main() -> None:
         help="Skip downloading free US national mapping ortho (NAIP) during fetch.",
     )
     parser.add_argument(
-        "--verify-method", type=str, default="all",
-        choices=["all", "position", "ncc"],
-        help="Verification method: 'position' (A), 'ncc' (B), or 'all'. Default: all.",
+        "--verify-method", type=str, default="ncc",
+        choices=["all", "ncc"],
+        help="Verification method: 'ncc'. 'all' is kept as a compatibility alias. Default: ncc.",
     )
     parser.add_argument(
         "--reference-source", type=str, default="sentinel",
@@ -239,6 +271,13 @@ def main() -> None:
             "Reference source for NCC verification: 'sentinel' uses ESA GCP "
             "chips, 'us_naip' uses fetched US national ortho patches. "
             "Default: sentinel."
+        ),
+    )
+    parser.add_argument(
+        "--profile", action="store_true",
+        help=(
+            "Measure resource usage (wall time, peak RSS, CPU %%, GPU) "
+            "for each stage and save to outputs/<scene>/resource_profile.json."
         ),
     )
 
@@ -271,6 +310,7 @@ def main() -> None:
         reference_source=args.reference_source,
         no_gcp_chips=getattr(args, "no_gcp_chips", False),
         fetch_us_mapping=not getattr(args, "no_us_mapping", False),
+        profile=getattr(args, "profile", False),
     )
 
     # ── Dispatch ───────────────────────────────────────────────────
