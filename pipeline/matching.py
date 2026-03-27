@@ -14,7 +14,10 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import cv2
 import rasterio
-from rasterio.warp import reproject, Resampling
+from rasterio.transform import from_origin
+from rasterio import Affine
+from rasterio.warp import reproject, Resampling, transform_bounds
+from pyproj import Transformer, CRS
 import torch
 
 from .config import SceneConfig
@@ -31,51 +34,201 @@ logger = logging.getLogger(__name__)
 
 # ── Sentinel reprojection ──────────────────────────────────────────────
 
-def reproject_sentinel_to_phisat(
-    sentinel_ds: rasterio.DatasetReader,
+def create_scaled_intersection_grid(
+    phisat_img: np.ndarray,
     phisat_ds: rasterio.DatasetReader,
-    margin_pixels: int = 512,
-) -> Tuple[np.ndarray, rasterio.Affine]:
+    sentinel_img: np.ndarray,
+    sentinel_ds: rasterio.DatasetReader,
+    margin_pixels: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, rasterio.Affine, rasterio.crs.CRS, rasterio.Affine]:
     """
-    Reproject Sentinel-2 RGB onto the PhiSat-2 pixel grid (+ margin).
-    Returns (reprojected_rgb [H, W, 3], transform).
+    Reproject both images onto one shared virtual geometry for local matching:
+    - same CRS
+    - same pixel grid
+    - same overlap extent
+    - same target resolution (coarser/native-safe)
     """
-    logger.info(
-        "Reprojecting Sentinel-2 to PhiSat grid (+%d px margin)...",
-        margin_pixels)
+    logger.info("Projecting both images to shared virtual geometry...")
 
-    src_transform = phisat_ds.transform
-    src_crs = phisat_ds.crs
-    h, w = phisat_ds.height, phisat_ds.width
+    if sentinel_ds.crs and sentinel_ds.crs.is_projected:
+        common_crs = sentinel_ds.crs
+    elif phisat_ds.crs and phisat_ds.crs.is_projected:
+        common_crs = phisat_ds.crs
+    else:
+        phi_cx = 0.5 * (phisat_ds.bounds.left + phisat_ds.bounds.right)
+        phi_cy = 0.5 * (phisat_ds.bounds.bottom + phisat_ds.bounds.top)
+        to_wgs84 = Transformer.from_crs(phisat_ds.crs, "EPSG:4326", always_xy=True)
+        center_lon, center_lat = to_wgs84.transform(phi_cx, phi_cy)
+        zone = int(np.floor((center_lon + 180.0) / 6.0) + 1)
+        zone = max(1, min(60, zone))
+        epsg = 32600 + zone if center_lat >= 0 else 32700 + zone
+        common_crs = CRS.from_epsg(epsg)
 
-    new_w = w + 2 * margin_pixels
-    new_h = h + 2 * margin_pixels
-    dst_transform = (src_transform
-                     * rasterio.Affine.translation(-margin_pixels,
-                                                   -margin_pixels))
-
-    logger.info("  Target grid: %d×%d", new_w, new_h)
-
-    dest = np.zeros((3, new_h, new_w), dtype=np.uint8)
-    bands = [1, 2, 3] if sentinel_ds.count >= 3 else [1]
-
-    for i, band_idx in enumerate(bands):
-        idx = i if len(bands) > 1 else 0
-        reproject(
-            source=rasterio.band(sentinel_ds, band_idx),
-            destination=dest[idx],
-            src_transform=sentinel_ds.transform,
-            src_crs=sentinel_ds.crs,
-            dst_transform=dst_transform,
-            dst_crs=src_crs,
-            resampling=Resampling.cubic,
+    phisat_src_transform = phisat_ds.transform
+    col_vec = np.array([phisat_src_transform.a, phisat_src_transform.d], dtype=float)
+    row_vec = np.array([phisat_src_transform.b, phisat_src_transform.e], dtype=float)
+    col_mag = float(np.linalg.norm(col_vec))
+    row_mag = float(np.linalg.norm(row_vec))
+    anisotropy = max(col_mag, row_mag) / max(min(col_mag, row_mag), 1e-12)
+    if anisotropy > 1.5:
+        if row_mag < 1e-12:
+            row_dir = np.array([-col_vec[1], col_vec[0]], dtype=float)
+            row_dir /= max(float(np.linalg.norm(row_dir)), 1e-12)
+        else:
+            row_dir = row_vec / row_mag
+        row_new = row_dir * col_mag
+        cross = col_vec[0] * row_vec[1] - col_vec[1] * row_vec[0]
+        cross_new = col_vec[0] * row_new[1] - col_vec[1] * row_new[0]
+        if cross * cross_new < 0:
+            row_new = -row_new
+        phisat_src_transform = Affine(
+            col_vec[0], row_new[0], phisat_src_transform.c,
+            col_vec[1], row_new[1], phisat_src_transform.f,
         )
-        if len(bands) == 1:
-            dest[1] = dest[0]
-            dest[2] = dest[0]
+        logger.info(
+            "Applied PhiSat isotropic transform correction for matching (anisotropy %.2f)",
+            anisotropy,
+        )
 
-    return np.transpose(dest, (1, 2, 0)), dst_transform
+    phisat_corners = [
+        (0.0, 0.0),
+        (float(phisat_ds.width), 0.0),
+        (float(phisat_ds.width), float(phisat_ds.height)),
+        (0.0, float(phisat_ds.height)),
+    ]
+    phisat_world = [phisat_src_transform * c for c in phisat_corners]
+    phi_xs, phi_ys = zip(*phisat_world)
+    phi_bounds = transform_bounds(
+        phisat_ds.crs,
+        common_crs,
+        min(phi_xs), min(phi_ys), max(phi_xs), max(phi_ys),
+        densify_pts=21,
+    )
+    sen_bounds = transform_bounds(
+        sentinel_ds.crs,
+        common_crs,
+        *sentinel_ds.bounds,
+        densify_pts=21,
+    )
 
+    inter_left = max(phi_bounds[0], sen_bounds[0])
+    inter_bottom = max(phi_bounds[1], sen_bounds[1])
+    inter_right = min(phi_bounds[2], sen_bounds[2])
+    inter_top = min(phi_bounds[3], sen_bounds[3])
+
+    if inter_right <= inter_left or inter_top <= inter_bottom:
+        raise ValueError("No overlap between PhiSat and Sentinel after CRS harmonization")
+
+    union_left = min(phi_bounds[0], sen_bounds[0])
+    union_bottom = min(phi_bounds[1], sen_bounds[1])
+    union_right = max(phi_bounds[2], sen_bounds[2])
+    union_top = max(phi_bounds[3], sen_bounds[3])
+
+    phi_res_x = abs((phi_bounds[2] - phi_bounds[0]) / max(1, phisat_ds.width))
+    phi_res_y = abs((phi_bounds[3] - phi_bounds[1]) / max(1, phisat_ds.height))
+    sen_res_x = abs((sen_bounds[2] - sen_bounds[0]) / max(1, sentinel_ds.width))
+    sen_res_y = abs((sen_bounds[3] - sen_bounds[1]) / max(1, sentinel_ds.height))
+
+    target_res = max(phi_res_x, phi_res_y, sen_res_x, sen_res_y)
+    max_target_res_m = 20.0
+    if target_res > max_target_res_m:
+        logger.info(
+            "Capping coarse target resolution from %.3f to %.3f for matching",
+            target_res,
+            max_target_res_m,
+        )
+        target_res = max_target_res_m
+    pad = max(0, margin_pixels) * target_res
+
+    # Keep full PhiSat footprint (do not cut it off), optionally extend with
+    # a matching margin around the overlap area, clipped to union bounds.
+    left = min(phi_bounds[0], inter_left - pad)
+    right = max(phi_bounds[2], inter_right + pad)
+    bottom = min(phi_bounds[1], inter_bottom - pad)
+    top = max(phi_bounds[3], inter_top + pad)
+
+    left = max(union_left, left)
+    right = min(union_right, right)
+    bottom = max(union_bottom, bottom)
+    top = min(union_top, top)
+
+    target_w = int(np.ceil((right - left) / target_res))
+    target_h = int(np.ceil((top - bottom) / target_res))
+    if target_w < 1 or target_h < 1:
+        raise ValueError("Invalid target grid size from shared geometry")
+
+    common_transform = from_origin(left, top, target_res, target_res)
+    logger.info(
+        "Shared grid: CRS=%s, res=%.3f, size=%dx%d",
+        common_crs,
+        target_res,
+        target_w,
+        target_h,
+    )
+    
+    def reproject_img(src_img, src_ds, src_transform, dst_transform, target_w, target_h, dst_crs):
+        out = np.zeros((3, target_h, target_w), dtype=np.float32)
+        src = src_img if src_img.ndim == 3 else np.stack([src_img]*3, axis=-1)
+            
+        channels = [0, 1, 2] if src.shape[2] >= 3 else [0]
+        for i, channel_idx in enumerate(channels):
+            dst_idx = i if len(channels) > 1 else 0
+            reproject(
+                source=src[..., channel_idx].astype(np.float32),
+                destination=out[dst_idx],
+                src_transform=src_transform,
+                src_crs=src_ds.crs,
+                dst_transform=dst_transform,
+                dst_crs=dst_crs,
+                resampling=Resampling.bilinear,
+                src_nodata=0,
+                dst_nodata=0,
+                init_dest_nodata=True,
+            )
+            if len(channels) == 1:
+                out[1] = out[0]
+                out[2] = out[0]
+
+        valid = np.zeros((target_h, target_w), dtype=np.uint8)
+        reproject(
+            source=np.ones((src_ds.height, src_ds.width), dtype=np.uint8),
+            destination=valid,
+            src_transform=src_transform,
+            src_crs=src_ds.crs,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            resampling=Resampling.nearest,
+            src_nodata=0,
+            dst_nodata=0,
+            init_dest_nodata=True,
+        )
+                
+        out = np.clip(out, 0, 255).astype(np.uint8).transpose((1, 2, 0))
+        return out, valid > 0
+
+    # Project both to the new 10m shared grid
+    phisat_aligned, phisat_valid = reproject_img(
+        phisat_img, phisat_ds, phisat_src_transform, common_transform, target_w, target_h, common_crs
+    )
+    sentinel_aligned, sentinel_valid = reproject_img(
+        sentinel_img, sentinel_ds, sentinel_ds.transform, common_transform, target_w, target_h, common_crs
+    )
+
+    overlap_valid = phisat_valid & sentinel_valid
+    if not np.any(overlap_valid):
+        raise ValueError("No mutual valid pixels after reprojection")
+
+    overlap_pixels = int(np.count_nonzero(overlap_valid))
+    phi_pixels = int(np.count_nonzero(phisat_valid))
+    overlap_ratio = overlap_pixels / max(1, phi_pixels)
+    logger.info(
+        "Keeping full PhiSat canvas: size=%dx%d (overlap with Sentinel: %.1f%% of PhiSat area)",
+        target_w,
+        target_h,
+        100.0 * overlap_ratio,
+    )
+
+    return phisat_aligned, sentinel_aligned, common_transform, common_crs, phisat_src_transform
 
 # ── RANSAC filter ──────────────────────────────────────────────────────
 
@@ -196,21 +349,36 @@ def run_matching(config: SceneConfig,
         raise FileNotFoundError(
             f"Sentinel band '{config.sentinel_band}' not found "
             f"in {config.sentinel_dir_path}")
-    _, sentinel_ds = load_satellite_image(sentinel_path)
+    sentinel_img, sentinel_ds = load_satellite_image(sentinel_path)
 
-    # 2. Reproject Sentinel
-    sentinel_aligned, sentinel_tf = reproject_sentinel_to_phisat(
-        sentinel_ds, phisat_ds, margin_pixels=config.margin_pixels)
+    # Save native (non-reprojected) PhiSat debug image for geometry sanity checks
+    cv2.imwrite(
+        str(config.output_dir / "debug_phisat_native.jpg"),
+        cv2.cvtColor(phisat_img, cv2.COLOR_RGB2BGR),
+    )
 
-    # 3. Enhance
+    # 2. Build shared virtual geometry and reproject both images
+    phisat_aligned, sentinel_aligned, common_tf, common_crs, phisat_effective_transform = create_scaled_intersection_grid(
+        phisat_img, phisat_ds,
+        sentinel_img, sentinel_ds,
+        margin_pixels=config.margin_pixels
+    )
+
+    # Save raw reprojected debug images
+    cv2.imwrite(str(config.debug_phisat_path),
+                cv2.cvtColor(phisat_aligned, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(config.debug_sentinel_path),
+                cv2.cvtColor(sentinel_aligned, cv2.COLOR_RGB2BGR))
+
+    # 3. Enhance for matching
     logger.info("Enhancing images...")
-    phi_enh = enhance_for_matching(phisat_img)
+    phi_enh = enhance_for_matching(phisat_aligned)
     sen_enh = enhance_for_matching(sentinel_aligned)
 
-    # Save debug images
-    cv2.imwrite(str(config.debug_phisat_path),
+    # Save enhanced debug variants
+    cv2.imwrite(str(config.output_dir / "debug_phisat_enh.jpg"),
                 cv2.cvtColor(phi_enh, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(str(config.debug_sentinel_path),
+    cv2.imwrite(str(config.output_dir / "debug_sentinel_enh.jpg"),
                 cv2.cvtColor(sen_enh, cv2.COLOR_RGB2BGR))
     logger.info("  Debug images → %s", config.output_dir)
 
@@ -237,12 +405,24 @@ def run_matching(config: SceneConfig,
     visualize_matches(phi_enh, sen_enh, kp0, kp1, str(viz_path))
 
     # 7. Geo-coordinates
+    phi_transform_inv = ~phisat_effective_transform
+
+    common_to_phi = Transformer.from_crs(common_crs, phisat_ds.crs, always_xy=True)
+    common_to_wgs84 = Transformer.from_crs(common_crs, "EPSG:4326", always_xy=True)
+
     tie_points: List[Dict] = []
     for (px, py), (sx, sy) in zip(kp0, kp1):
-        lon, lat = sentinel_tf * (float(sx), float(sy))
+        # Coordinates in aligned grid map identically through the master transform
+        common_x_phi, common_y_phi = common_tf * (float(px), float(py))
+        phi_x, phi_y = common_to_phi.transform(common_x_phi, common_y_phi)
+        orig_px, orig_py = phi_transform_inv * (phi_x, phi_y)
+
+        common_x_sen, common_y_sen = common_tf * (float(sx), float(sy))
+        lon, lat = common_to_wgs84.transform(common_x_sen, common_y_sen)
+
         tie_points.append({
-            "phisat_x": float(px),
-            "phisat_y": float(py),
+            "phisat_x": float(orig_px),
+            "phisat_y": float(orig_py),
             "lon": float(lon),
             "lat": float(lat),
         })
