@@ -1,13 +1,9 @@
 """
 Sentinel-2 GCP verification of orthorectified PhiSat-2 imagery.
 
-Two independent verification methods:
+Verification method:
 
-  A) **Position-based (ICP)**
-     Compare known GCP (lon, lat) against ortho pixel centres.
-     Quick sanity check — no cross-correlation needed.
-
-  B) **GCP-chip NCC cross-correlation**
+    **GCP-chip NCC cross-correlation**
      Match ESA Sentinel-2 L1C reference chips (57×57 @ 10 m, UTM)
      against ortho patches using normalised cross-correlation.
 
@@ -42,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# GCP loading / selection  (shared by A and B)
+# GCP loading / selection  (shared)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _load_all_gcps(gcp_json_path: Path,
@@ -178,7 +174,7 @@ def _select_gcps(config: SceneConfig,
                  require_chip: bool = True,
                  ) -> Tuple[List[dict], dict]:
     """
-    Full GCP selection pipeline shared by all three methods.
+    Full GCP selection pipeline shared by verification methods.
 
     Returns (selected_gcps, meta_dict).
     """
@@ -596,94 +592,6 @@ def _save_json(path: Path, results: List[dict], stats: dict,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# METHOD A — Position-based (ICP)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def verify_position(config: SceneConfig) -> dict:
-    """
-    Compare known GCP (lon, lat) against ortho pixel centres.
-
-    For each GCP the nearest ortho pixel centre is computed and the
-    easting/northing residual (in the GCP's native UTM) is reported.
-    """
-    ortho_path = str(config.ortho_path)
-
-    logger.info("\n" + "=" * 72)
-    logger.info(f"METHOD A — Position-based (ICP) — scene '{config.name}'")
-    logger.info("=" * 72)
-
-    with rasterio.open(ortho_path) as src:
-        ob = src.bounds
-        ortho_data = src.read()
-        ortho_crs = src.crs
-        ortho_tf   = src.transform
-        ortho_crs  = src.crs
-
-    gcps, meta = _select_gcps(config, ob, ortho_data, ortho_crs, ortho_tf,
-                              require_chip=False)
-
-    if not gcps:
-        logger.info("  No usable GCPs.")
-        return dict(results=[], stats={}, meta=meta)
-
-    try:
-        from pyproj import Transformer
-    except ImportError:
-        raise ImportError("Method A requires pyproj  (pip install pyproj)")
-
-    logger.info(
-        f"\n{'ID':<16s} {'Lon':>11s} {'Lat':>10s} {'Q':>2s} "
-        f"{'dE_m':>8s} {'dN_m':>8s} {'Err_m':>8s} {'Err_px':>7s}")
-    logger.info("─" * 75)
-
-    results: List[dict] = []
-
-    for g in gcps:
-        # GCP known position in its native UTM
-        e_gcp = g["x_utm"]
-        n_gcp = g["y_utm"]
-        gcp_epsg = g["epsg"]
-
-        # Ortho pixel index for this GCP
-        col = g["ortho_col"]
-        row = g["ortho_row"]
-
-        # Ortho pixel centre in ortho CRS (lon/lat geographic)
-        lon_px = ortho_tf.c + (col + 0.5) * ortho_tf.a
-        lat_px = ortho_tf.f + (row + 0.5) * ortho_tf.e
-
-        # Transform ortho pixel centre → GCP's UTM
-        xfm = Transformer.from_crs(ortho_crs, f"EPSG:{gcp_epsg}",
-                                   always_xy=True)
-        e_px, n_px = xfm.transform(lon_px, lat_px)
-
-        east_m  = e_px - e_gcp
-        north_m = n_px - n_gcp
-        total_m = np.hypot(east_m, north_m)
-
-        results.append(dict(
-            id=g["id"], lon=g["lon"], lat=g["lat"],
-            alt=g["alt"], quality=g["quality"],
-            east_m=float(east_m), north_m=float(north_m),
-            total_m=float(total_m),
-        ))
-
-        logger.info(
-            f"{g['id']:<16s} {g['lon']:11.6f} {g['lat']:10.6f} "
-            f"{g['quality']:2d} "
-            f"{east_m:+8.1f} {north_m:+8.1f} {total_m:8.1f} "
-            f"{total_m / PIXEL_SIZE:7.2f}")
-
-    stats = _compute_stats(results)
-    _print_stats(stats, meta, "Position-based (ICP)")
-
-    out = config.output_dir / "verify_position.json"
-    _save_json(out, results, stats, meta, "position")
-
-    return dict(results=results, stats=stats, meta=meta)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # METHOD B — Two-pass GCP-chip NCC cross-correlation
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -964,11 +872,11 @@ def verify_ncc(config: SceneConfig,
 # Unified entry point
 # ═══════════════════════════════════════════════════════════════════════════
 
-VERIFY_METHODS = ["all", "position", "ncc"]
+VERIFY_METHODS = ["all", "ncc"]
 
 
 def run_verification(config: SceneConfig,
-                     method: str = "all",
+                     method: str = "ncc",
                      min_ncc: float = 0.25,
                      reference_source: str = "sentinel",
                      ) -> dict:
@@ -979,7 +887,8 @@ def run_verification(config: SceneConfig,
     ----------
     config : SceneConfig
     method : str
-        ``"all"`` runs A + B.  Or pick ``"position"`` or ``"ncc"``.
+        ``"ncc"`` runs NCC verification. ``"all"`` is accepted as
+        a backward-compatible alias for ``"ncc"``.
     min_ncc : float
         NCC threshold for method B.
     """
@@ -999,10 +908,19 @@ def run_verification(config: SceneConfig,
         raise FileNotFoundError(
             "Missing files for verify:\n  " + "\n  ".join(missing))
 
-    out: dict = {}
+    if method == "position":
+        raise ValueError(
+            "Verification method 'position' was removed. "
+            "Use method='ncc'."
+        )
 
-    if method in ("all", "position"):
-        out["position"] = verify_position(config)
+    if method not in VERIFY_METHODS:
+        raise ValueError(
+            f"Unknown verification method '{method}'. "
+            f"Available: {', '.join(VERIFY_METHODS)}"
+        )
+
+    out: dict = {}
 
     if method in ("all", "ncc"):
         out["ncc"] = verify_ncc(config, min_ncc=min_ncc,
