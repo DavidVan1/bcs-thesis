@@ -34,21 +34,19 @@ logger = logging.getLogger(__name__)
 
 # ── Sentinel reprojection ──────────────────────────────────────────────
 
-def create_scaled_intersection_grid(
+def create_independent_scaled_grids(
     phisat_img: np.ndarray,
     phisat_ds: rasterio.DatasetReader,
     sentinel_img: np.ndarray,
     sentinel_ds: rasterio.DatasetReader,
     margin_pixels: int = 0,
-) -> Tuple[np.ndarray, np.ndarray, rasterio.Affine, rasterio.crs.CRS, rasterio.Affine]:
+) -> Tuple[np.ndarray, np.ndarray, rasterio.Affine, rasterio.Affine, rasterio.crs.CRS, rasterio.Affine]:
     """
-    Reproject both images onto one shared virtual geometry for local matching:
-    - same CRS
-    - same pixel grid
-    - same overlap extent
-    - same target resolution (coarser/native-safe)
+    Reproject both images independently so they don't share a canvas, 
+    but share a target resolution and CRS. This prevents the large Sentinel scene
+    from shrinking the PhiSat image during deep-learning resize steps.
     """
-    logger.info("Projecting both images to shared virtual geometry...")
+    logger.info("Projecting images to independent virtual geometries...")
 
     if sentinel_ds.crs and sentinel_ds.crs.is_projected:
         common_crs = sentinel_ds.crs
@@ -140,30 +138,29 @@ def create_scaled_intersection_grid(
         target_res = max_target_res_m
     pad = max(0, margin_pixels) * target_res
 
-    # Keep full PhiSat footprint (do not cut it off), optionally extend with
-    # a matching margin around the overlap area, clipped to union bounds.
-    left = min(phi_bounds[0], inter_left - pad)
-    right = max(phi_bounds[2], inter_right + pad)
-    bottom = min(phi_bounds[1], inter_bottom - pad)
-    top = max(phi_bounds[3], inter_top + pad)
+    # PhiSat grid: just its own coordinates, slightly padded.
+    phi_left, phi_bottom, phi_right, phi_top = phi_bounds
+    phi_left -= pad; phi_right += pad
+    phi_bottom -= pad; phi_top += pad
 
-    left = max(union_left, left)
-    right = min(union_right, right)
-    bottom = max(union_bottom, bottom)
-    top = min(union_top, top)
+    phi_target_w = int(np.ceil((phi_right - phi_left) / target_res))
+    phi_target_h = int(np.ceil((phi_top - phi_bottom) / target_res))
 
-    target_w = int(np.ceil((right - left) / target_res))
-    target_h = int(np.ceil((top - bottom) / target_res))
-    if target_w < 1 or target_h < 1:
-        raise ValueError("Invalid target grid size from shared geometry")
+    # Sentinel grid: the FULL Sentinel image, no clipping.
+    sen_left, sen_bottom, sen_right, sen_top = sen_bounds
+    
+    sen_target_w = int(np.ceil((sen_right - sen_left) / target_res))
+    sen_target_h = int(np.ceil((sen_top - sen_bottom) / target_res))
 
-    common_transform = from_origin(left, top, target_res, target_res)
+    phi_common_transform = from_origin(phi_left, phi_top, target_res, target_res)
+    sen_common_transform = from_origin(sen_left, sen_top, target_res, target_res)
+    
     logger.info(
-        "Shared grid: CRS=%s, res=%.3f, size=%dx%d",
-        common_crs,
-        target_res,
-        target_w,
-        target_h,
+        "PhiSat grid: size=%dx%d | Sentinel grid: size=%dx%d",
+        phi_target_w,
+        phi_target_h,
+        sen_target_w,
+        sen_target_h,
     )
     
     def reproject_img(src_img, src_ds, src_transform, dst_transform, target_w, target_h, dst_crs):
@@ -206,29 +203,18 @@ def create_scaled_intersection_grid(
         out = np.clip(out, 0, 255).astype(np.uint8).transpose((1, 2, 0))
         return out, valid > 0
 
-    # Project both to the new 10m shared grid
+    # Project both to the new independent 10m shared grid
     phisat_aligned, phisat_valid = reproject_img(
-        phisat_img, phisat_ds, phisat_src_transform, common_transform, target_w, target_h, common_crs
+        phisat_img, phisat_ds, phisat_src_transform, phi_common_transform, phi_target_w, phi_target_h, common_crs
     )
     sentinel_aligned, sentinel_valid = reproject_img(
-        sentinel_img, sentinel_ds, sentinel_ds.transform, common_transform, target_w, target_h, common_crs
+        sentinel_img, sentinel_ds, sentinel_ds.transform, sen_common_transform, sen_target_w, sen_target_h, common_crs
     )
 
-    overlap_valid = phisat_valid & sentinel_valid
-    if not np.any(overlap_valid):
-        raise ValueError("No mutual valid pixels after reprojection")
+    if not np.any(phisat_valid) or not np.any(sentinel_valid):
+        raise ValueError("Invalid reprojection (no valid pixels in one or both images)")
 
-    overlap_pixels = int(np.count_nonzero(overlap_valid))
-    phi_pixels = int(np.count_nonzero(phisat_valid))
-    overlap_ratio = overlap_pixels / max(1, phi_pixels)
-    logger.info(
-        "Keeping full PhiSat canvas: size=%dx%d (overlap with Sentinel: %.1f%% of PhiSat area)",
-        target_w,
-        target_h,
-        100.0 * overlap_ratio,
-    )
-
-    return phisat_aligned, sentinel_aligned, common_transform, common_crs, phisat_src_transform
+    return phisat_aligned, sentinel_aligned, phi_common_transform, sen_common_transform, common_crs, phisat_src_transform
 
 # ── RANSAC filter ──────────────────────────────────────────────────────
 
@@ -358,7 +344,7 @@ def run_matching(config: SceneConfig,
     )
 
     # 2. Build shared virtual geometry and reproject both images
-    phisat_aligned, sentinel_aligned, common_tf, common_crs, phisat_effective_transform = create_scaled_intersection_grid(
+    phisat_aligned, sentinel_aligned, phi_tf, sen_tf, common_crs, phisat_effective_transform = create_independent_scaled_grids(
         phisat_img, phisat_ds,
         sentinel_img, sentinel_ds,
         margin_pixels=config.margin_pixels
@@ -382,13 +368,56 @@ def run_matching(config: SceneConfig,
                 cv2.cvtColor(sen_enh, cv2.COLOR_RGB2BGR))
     logger.info("  Debug images → %s", config.output_dir)
 
-    # 4. Match
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # 4. Match (using a sliding window over the massive Sentinel image)
+    device = "cpu" #"cuda" if torch.cuda.is_available() else "cpu"
     matcher = get_matcher(matcher_name, device=device,
                           max_keypoints=config.max_keypoints)
-    result = matcher.match(phi_enh, sen_enh)
-    kp0, kp1 = result["keypoints0"], result["keypoints1"]
-    logger.info("Raw matches: %d", len(kp0))
+    
+    phi_h, phi_w = phi_enh.shape[:2]
+    sen_h, sen_w = sen_enh.shape[:2]
+    
+    # We stride across the Sentinel image in chunks roughly the size of the PhiSat image.
+    # This guarantees the neural network sees exactly the same scale!
+    step_y = max(1, int(phi_h * 0.75))
+    step_x = max(1, int(phi_w * 0.75))
+    
+    all_kp0 = []
+    all_kp1 = []
+    
+    logger.info("Matching via sliding window (window %dx%d, sentinel %dx%d)...", phi_w, phi_h, sen_w, sen_h)
+    
+    for y_start in range(0, sen_h, step_y):
+        for x_start in range(0, sen_w, step_x):
+            y_end = min(sen_h, y_start + phi_h)
+            x_end = min(sen_w, x_start + phi_w)
+            
+            # If the crop at the edge is too small, shift it back to maintain size
+            # so the matcher doesn't act weirdly on tiny strips.
+            if y_end - y_start < phi_h and y_start > 0:
+                y_start = max(0, y_end - phi_h)
+            if x_end - x_start < phi_w and x_start > 0:
+                x_start = max(0, x_end - phi_w)
+                
+            sen_crop = sen_enh[y_start:y_end, x_start:x_end]
+            
+            # Only match if the crop has legitimate valid data (not entirely black/empty padding)
+            if np.mean(sen_crop) > 5.0:
+                res = matcher.match(phi_enh, sen_crop)
+                
+                if len(res["keypoints0"]) > 0:
+                    all_kp0.append(res["keypoints0"])
+                    
+                    # Shift Sentinel keypoints back to full-image coordinates
+                    shifted_kp1 = res["keypoints1"] + np.array([[x_start, y_start]])
+                    all_kp1.append(shifted_kp1)
+    
+    if all_kp0:
+        kp0 = np.concatenate(all_kp0, axis=0)
+        kp1 = np.concatenate(all_kp1, axis=0)
+    else:
+        kp0, kp1 = np.empty((0, 2)), np.empty((0, 2))
+        
+    logger.info("Raw matches (accumulated): %d", len(kp0))
 
     # 5. RANSAC
     kp0, kp1 = ransac_filter(kp0, kp1)
@@ -413,11 +442,11 @@ def run_matching(config: SceneConfig,
     tie_points: List[Dict] = []
     for (px, py), (sx, sy) in zip(kp0, kp1):
         # Coordinates in aligned grid map identically through the master transform
-        common_x_phi, common_y_phi = common_tf * (float(px), float(py))
+        common_x_phi, common_y_phi = phi_tf * (float(px), float(py))
         phi_x, phi_y = common_to_phi.transform(common_x_phi, common_y_phi)
         orig_px, orig_py = phi_transform_inv * (phi_x, phi_y)
 
-        common_x_sen, common_y_sen = common_tf * (float(sx), float(sy))
+        common_x_sen, common_y_sen = sen_tf * (float(sx), float(sy))
         lon, lat = common_to_wgs84.transform(common_x_sen, common_y_sen)
 
         tie_points.append({
