@@ -27,6 +27,7 @@ Use :func:`get_matcher` as the single entry point::
 from __future__ import annotations
 
 import sys
+import pickle
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, Optional
@@ -104,6 +105,16 @@ def _resize_divisible(img: np.ndarray, max_side: int, dfactor: int,
 def _rescale_keypoints(kp: np.ndarray, scale: np.ndarray) -> np.ndarray:
     """Scale keypoints from resized coordinates back to original."""
     return kp * scale[np.newaxis, :]
+
+
+def _get_proportional_max_sides(img0: np.ndarray, img1: np.ndarray, base_max: int) -> tuple[int, int]:
+    """Calculate max_side for both images so they maintain the same physical scale."""
+    max_d0 = max(img0.shape[:2])
+    max_d1 = max(img1.shape[:2])
+    scale = base_max / max(1, max_d0, max_d1)
+    if scale > 1.0:
+        scale = 1.0
+    return max(32, int(round(max_d0 * scale))), max(32, int(round(max_d1 * scale)))
 
 
 def _empty() -> Dict[str, np.ndarray]:
@@ -232,10 +243,11 @@ class XoFTRMatcher(BaseMatcher):
         logger.info("  XoFTR on %s", device)
 
     def match(self, img0, img1):
-        img0r, sc0 = _resize_divisible(img0, 1024, self._DFACTOR,
-                                        force_size=(self._WIDTH, self._HEIGHT))
-        img1r, sc1 = _resize_divisible(img1, 1024, self._DFACTOR,
-                                        force_size=(self._WIDTH, self._HEIGHT))
+        side0, side1 = _get_proportional_max_sides(img0, img1, 1024)
+        img0r, sc0 = _resize_divisible(img0, side0, self._DFACTOR
+                                        )
+        img1r, sc1 = _resize_divisible(img1, side1, self._DFACTOR
+                                        )
         t0 = _to_grayscale_tensor(img0r, self.device)
         t1 = _to_grayscale_tensor(img1r, self.device)
         with torch.no_grad():
@@ -275,10 +287,11 @@ class LoFTRMatcher(BaseMatcher):
         logger.info("  MiniMA-LoFTR on %s", device)
 
     def match(self, img0, img1):
-        img0r, sc0 = _resize_divisible(img0, 1024, self._DFACTOR,
-                                        force_size=(self._WIDTH, self._HEIGHT))
-        img1r, sc1 = _resize_divisible(img1, 1024, self._DFACTOR,
-                                        force_size=(self._WIDTH, self._HEIGHT))
+        side0, side1 = _get_proportional_max_sides(img0, img1, 1024)
+        img0r, sc0 = _resize_divisible(img0, side0, self._DFACTOR
+                                        )
+        img1r, sc1 = _resize_divisible(img1, side1, self._DFACTOR
+                                        )
         t0 = _to_grayscale_tensor(img0r, self.device)
         t1 = _to_grayscale_tensor(img1r, self.device)
         with torch.no_grad():
@@ -323,7 +336,16 @@ class EfficientLoFTRMatcher(BaseMatcher):
 
         # Instantiate and load weights
         ckpt_path = _eloftr_root / "weights" / "eloftr_outdoor.ckpt"
-        state_dict = torch.load(str(ckpt_path), map_location="cpu")["state_dict"]
+        try:
+            ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
+        except (TypeError, pickle.UnpicklingError, RuntimeError) as exc:
+            logger.warning(
+                "  EfficientLoFTR checkpoint is not weights-only compatible (%s). "
+                "Falling back to weights_only=False for trusted local checkpoint.",
+                exc.__class__.__name__,
+            )
+            ckpt = torch.load(str(ckpt_path), map_location="cpu")
+        state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
         self.net = ELoFTR(config=_config["loftr"])
         self.net.load_state_dict(state_dict, strict=False)
         self.net = reparameter(self.net)
@@ -331,10 +353,11 @@ class EfficientLoFTRMatcher(BaseMatcher):
         logger.info("  EfficientLoFTR on %s", device)
 
     def match(self, img0, img1):
-        img0r, sc0 = _resize_divisible(img0, 1024, self._DFACTOR,
-                                        force_size=(self._WIDTH, self._HEIGHT))
-        img1r, sc1 = _resize_divisible(img1, 1024, self._DFACTOR,
-                                        force_size=(self._WIDTH, self._HEIGHT))
+        side0, side1 = _get_proportional_max_sides(img0, img1, 1024)
+        img0r, sc0 = _resize_divisible(img0, side0, self._DFACTOR
+                                        )
+        img1r, sc1 = _resize_divisible(img1, side1, self._DFACTOR
+                                        )
         t0 = _to_grayscale_tensor(img0r, self.device)
         t1 = _to_grayscale_tensor(img1r, self.device)
         data = {"image0": t0, "image1": t1}
@@ -383,10 +406,11 @@ class RoMAMatcher(BaseMatcher):
         # RoMa handles its own internal resizing, but we still
         # force-resize to 320x240 following the hloc config and
         # scale keypoints back afterwards.
-        img0r, sc0 = _resize_divisible(img0, 1024, self._DFACTOR,
-                                        force_size=(self._WIDTH, self._HEIGHT))
-        img1r, sc1 = _resize_divisible(img1, 1024, self._DFACTOR,
-                                        force_size=(self._WIDTH, self._HEIGHT))
+        side0, side1 = _get_proportional_max_sides(img0, img1, 1024)
+        img0r, sc0 = _resize_divisible(img0, side0, self._DFACTOR
+                                        )
+        img1r, sc1 = _resize_divisible(img1, side1, self._DFACTOR
+                                        )
         t0 = _to_rgb_tensor(img0r, self.device)
         t1 = _to_rgb_tensor(img1r, self.device)
         with torch.no_grad():
@@ -425,8 +449,9 @@ class MASt3RMatcher(BaseMatcher):
         logger.info("  MASt3R on %s", device)
 
     def match(self, img0, img1):
-        img0r, sc0 = _resize_divisible(img0, self._MAX_SIDE, self._DFACTOR)
-        img1r, sc1 = _resize_divisible(img1, self._MAX_SIDE, self._DFACTOR)
+        side0, side1 = _get_proportional_max_sides(img0, img1, self._MAX_SIDE)
+        img0r, sc0 = _resize_divisible(img0, side0, self._DFACTOR)
+        img1r, sc1 = _resize_divisible(img1, side1, self._DFACTOR)
         t0 = _to_rgb_tensor(img0r, self.device)
         t1 = _to_rgb_tensor(img1r, self.device)
         with torch.no_grad():
@@ -465,8 +490,9 @@ class DUSt3RMatcher(BaseMatcher):
         logger.info("  DUSt3R on %s", device)
 
     def match(self, img0, img1):
-        img0r, sc0 = _resize_divisible(img0, self._MAX_SIDE, self._DFACTOR)
-        img1r, sc1 = _resize_divisible(img1, self._MAX_SIDE, self._DFACTOR)
+        side0, side1 = _get_proportional_max_sides(img0, img1, self._MAX_SIDE)
+        img0r, sc0 = _resize_divisible(img0, side0, self._DFACTOR)
+        img1r, sc1 = _resize_divisible(img1, side1, self._DFACTOR)
         t0 = _to_rgb_tensor(img0r, self.device)
         t1 = _to_rgb_tensor(img1r, self.device)
         with torch.no_grad():
