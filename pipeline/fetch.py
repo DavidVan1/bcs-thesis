@@ -122,7 +122,7 @@ def _adaptive_fetch_margin(
     *,
     ratio: float = 0.06,
     min_deg: float = 0.01,
-    max_deg: float = 0.03,
+    max_deg: float = 0.50,
 ) -> float:
     """
     Compute a scene-size-aware margin (degrees) for fetch-time AOIs.
@@ -196,6 +196,7 @@ def download_sentinel(
     min_coverage: float = 0.70,
     scale_m: float = 10.0,
     region_buffer_m: float = 5000.0,
+    clip_to_region: bool = False,
 ) -> Path:
     """
     Download the least-cloudy Sentinel-2 TCI (True Colour Image) covering
@@ -342,14 +343,25 @@ def download_sentinel(
     gd_img = BaseImage(tci_image)
 
     logger.info("  Downloading TCI to %s ...", out_tif)
-    gd_img.download(
-        str(out_tif),
-        region=region,
-        scale=scale_m,
-        crs=native_crs,
-        dtype="uint8",
-        overwrite=True,
-    )
+    if clip_to_region:
+        logger.info("  Export mode         : clipped to AOI+buffer")
+        gd_img.download(
+            str(out_tif),
+            region=region,
+            scale=scale_m,
+            crs=native_crs,
+            dtype="uint8",
+            overwrite=True,
+        )
+    else:
+        logger.info("  Export mode         : full Sentinel scene (no clipping)")
+        gd_img.download(
+            str(out_tif),
+            scale=scale_m,
+            crs=native_crs,
+            dtype="uint8",
+            overwrite=True,
+        )
     logger.info("  Saved: %s", out_tif)
     return out_tif
 
