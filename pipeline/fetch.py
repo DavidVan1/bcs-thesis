@@ -193,7 +193,7 @@ def download_sentinel(
     *,
     date_window_days: int = 90,
     max_cloud_pct: float = 5.0,
-    min_coverage: float = 0.70,
+    min_coverage: float = 0.68,
     scale_m: float = 10.0,
     region_buffer_m: float = 5000.0,
     clip_to_region: bool = False,
@@ -376,7 +376,7 @@ def download_dem(
     output_path: Path,
     *,
     scale_m: float = 30.0,
-    region_buffer_m: float = 15000.0,
+    region_buffer_m: float = 50000.0,
 ) -> Path:
     """
     Download Copernicus GLO-30 DEM for the footprint from Google Earth Engine.
