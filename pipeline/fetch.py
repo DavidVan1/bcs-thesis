@@ -376,7 +376,7 @@ def download_dem(
     output_path: Path,
     *,
     scale_m: float = 30.0,
-    region_buffer_m: float = 50000.0,
+    region_buffer_m: float = 80000.0,
 ) -> Path:
     """
     Download Copernicus GLO-30 DEM for the footprint from Google Earth Engine.
