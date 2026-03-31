@@ -65,6 +65,42 @@ def _query_gpu() -> Optional[Dict[str, float]]:
         return None
 
 
+def _query_process_gpu_mem(pid: int) -> float:
+    """
+    Return GPU memory used by a specific process, in MB.
+
+    This queries nvidia-smi's compute-apps table and sums the memory
+    reported for the current PID across all GPUs. If the process is not
+    visible to nvidia-smi, returns 0.0.
+    """
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            timeout=5,
+        ).strip()
+    except Exception:
+        return 0.0
+
+    total = 0.0
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            row_pid = int(parts[0])
+            used_mb = float(parts[1])
+        except ValueError:
+            continue
+        if row_pid == pid:
+            total += used_mb
+    return total
+
+
 # ── Data classes ────────────────────────────────────────────────────────
 
 @dataclass
@@ -146,6 +182,7 @@ def profile_stage(name: str, *, use_gpu: bool = False):
         print(prof.wall_time_s)
     """
     proc = psutil.Process(os.getpid())
+    pid = os.getpid()
     prof = StageProfile(stage=name)
 
     # snapshot before
@@ -155,7 +192,7 @@ def profile_stage(name: str, *, use_gpu: bool = False):
     if use_gpu:
         snap = _query_gpu()
         if snap:
-            gpu_peak_mem = snap["gpu_mem_used_mb"]
+            gpu_peak_mem = _query_process_gpu_mem(pid)
 
     t0 = time.perf_counter()
     try:
@@ -170,7 +207,7 @@ def profile_stage(name: str, *, use_gpu: bool = False):
         if use_gpu:
             snap = _query_gpu()
             if snap:
-                mem_now = snap["gpu_mem_used_mb"]
+                mem_now = _query_process_gpu_mem(pid)
                 prof.gpu_peak_mem_mb = max(gpu_peak_mem, mem_now)
                 prof.gpu_util_pct = snap["gpu_util_pct"]
                 prof.gpu_total_mem_mb = snap["gpu_mem_total_mb"]
