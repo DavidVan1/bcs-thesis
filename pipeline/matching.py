@@ -32,7 +32,107 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
-# ── Sentinel reprojection ──────────────────────────────────────────────
+def _determine_common_crs(phisat_ds: rasterio.DatasetReader, sentinel_ds: rasterio.DatasetReader) -> CRS:
+    """Determine a shared CRS, defaulting to the projected CRS or calculating a UTM zone."""
+    if sentinel_ds.crs and sentinel_ds.crs.is_projected:
+        return sentinel_ds.crs
+    if phisat_ds.crs and phisat_ds.crs.is_projected:
+        return phisat_ds.crs
+        
+    # Fallback to calculating UTM zone from PhiSat center
+    phi_cx = 0.5 * (phisat_ds.bounds.left + phisat_ds.bounds.right)
+    phi_cy = 0.5 * (phisat_ds.bounds.bottom + phisat_ds.bounds.top)
+    to_wgs84 = Transformer.from_crs(phisat_ds.crs, "EPSG:4326", always_xy=True)
+    center_lon, center_lat = to_wgs84.transform(phi_cx, phi_cy)
+    
+    zone = int(np.floor((center_lon + 180.0) / 6.0) + 1)
+    zone = max(1, min(60, zone))
+    epsg = 32600 + zone if center_lat >= 0 else 32700 + zone
+    
+    return CRS.from_epsg(epsg)
+
+
+def _correct_anisotropy(transform: Affine) -> Affine:
+    """Corrects anisotropic transforms by forcing isotropic pixels if anisotropy > 1.5."""
+    col_vec = np.array([transform.a, transform.d], dtype=float)
+    row_vec = np.array([transform.b, transform.e], dtype=float)
+    col_mag = float(np.linalg.norm(col_vec))
+    row_mag = float(np.linalg.norm(row_vec))
+    
+    anisotropy = max(col_mag, row_mag) / max(min(col_mag, row_mag), 1e-12)
+    if anisotropy <= 1.5:
+        return transform
+
+    if row_mag < 1e-12:
+        row_dir = np.array([-col_vec[1], col_vec[0]], dtype=float)
+        row_dir /= max(float(np.linalg.norm(row_dir)), 1e-12)
+    else:
+        row_dir = row_vec / row_mag
+        
+    row_new = row_dir * col_mag
+    cross = col_vec[0] * row_vec[1] - col_vec[1] * row_vec[0]
+    cross_new = col_vec[0] * row_new[1] - col_vec[1] * row_new[0]
+    
+    if cross * cross_new < 0:
+        row_new = -row_new
+        
+    logger.info("Applied PhiSat isotropic transform correction for matching (anisotropy %.2f)", anisotropy)
+    
+    return Affine(
+        col_vec[0], row_new[0], transform.c,
+        col_vec[1], row_new[1], transform.f,
+    )
+
+
+def _reproject_image(
+    src_img: np.ndarray, 
+    src_ds: rasterio.DatasetReader, 
+    src_transform: Affine, 
+    dst_transform: Affine, 
+    target_w: int, 
+    target_h: int, 
+    dst_crs: CRS
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Handles the heavy lifting of reprojecting a single image and computing its validity mask."""
+    out = np.zeros((3, target_h, target_w), dtype=np.float32)
+    src = src_img if src_img.ndim == 3 else np.stack([src_img]*3, axis=-1)
+        
+    channels = [0, 1, 2] if src.shape[2] >= 3 else [0]
+    for i, channel_idx in enumerate(channels):
+        dst_idx = i if len(channels) > 1 else 0
+        reproject(
+            source=src[..., channel_idx].astype(np.float32),
+            destination=out[dst_idx],
+            src_transform=src_transform,
+            src_crs=src_ds.crs,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            resampling=Resampling.bilinear,
+            src_nodata=0,
+            dst_nodata=0,
+            init_dest_nodata=True,
+        )
+        if len(channels) == 1:
+            out[1] = out[0]
+            out[2] = out[0]
+
+    valid = np.zeros((target_h, target_w), dtype=np.uint8)
+    reproject(
+        source=np.ones((src_ds.height, src_ds.width), dtype=np.uint8),
+        destination=valid,
+        src_transform=src_transform,
+        src_crs=src_ds.crs,
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        resampling=Resampling.nearest,
+        src_nodata=0,
+        dst_nodata=0,
+        init_dest_nodata=True,
+    )
+            
+    out = np.clip(out, 0, 255).astype(np.uint8).transpose((1, 2, 0))
+    return out, valid > 0
+
 
 def create_independent_scaled_grids(
     phisat_img: np.ndarray,
@@ -40,7 +140,7 @@ def create_independent_scaled_grids(
     sentinel_img: np.ndarray,
     sentinel_ds: rasterio.DatasetReader,
     margin_pixels: int = 0,
-) -> Tuple[np.ndarray, np.ndarray, rasterio.Affine, rasterio.Affine, rasterio.crs.CRS, rasterio.Affine]:
+) -> Tuple[np.ndarray, np.ndarray, Affine, Affine, CRS, Affine]:
     """
     Reproject both images independently so they don't share a canvas, 
     but share a target resolution and CRS. This prevents the large Sentinel scene
@@ -48,46 +148,11 @@ def create_independent_scaled_grids(
     """
     logger.info("Projecting images to independent virtual geometries...")
 
-    if sentinel_ds.crs and sentinel_ds.crs.is_projected:
-        common_crs = sentinel_ds.crs
-    elif phisat_ds.crs and phisat_ds.crs.is_projected:
-        common_crs = phisat_ds.crs
-    else:
-        phi_cx = 0.5 * (phisat_ds.bounds.left + phisat_ds.bounds.right)
-        phi_cy = 0.5 * (phisat_ds.bounds.bottom + phisat_ds.bounds.top)
-        to_wgs84 = Transformer.from_crs(phisat_ds.crs, "EPSG:4326", always_xy=True)
-        center_lon, center_lat = to_wgs84.transform(phi_cx, phi_cy)
-        zone = int(np.floor((center_lon + 180.0) / 6.0) + 1)
-        zone = max(1, min(60, zone))
-        epsg = 32600 + zone if center_lat >= 0 else 32700 + zone
-        common_crs = CRS.from_epsg(epsg)
+    # 1. Coordinate Reference System Setup
+    common_crs = _determine_common_crs(phisat_ds, sentinel_ds)
+    phisat_src_transform = _correct_anisotropy(phisat_ds.transform)
 
-    phisat_src_transform = phisat_ds.transform
-    col_vec = np.array([phisat_src_transform.a, phisat_src_transform.d], dtype=float)
-    row_vec = np.array([phisat_src_transform.b, phisat_src_transform.e], dtype=float)
-    col_mag = float(np.linalg.norm(col_vec))
-    row_mag = float(np.linalg.norm(row_vec))
-    anisotropy = max(col_mag, row_mag) / max(min(col_mag, row_mag), 1e-12)
-    if anisotropy > 1.5:
-        if row_mag < 1e-12:
-            row_dir = np.array([-col_vec[1], col_vec[0]], dtype=float)
-            row_dir /= max(float(np.linalg.norm(row_dir)), 1e-12)
-        else:
-            row_dir = row_vec / row_mag
-        row_new = row_dir * col_mag
-        cross = col_vec[0] * row_vec[1] - col_vec[1] * row_vec[0]
-        cross_new = col_vec[0] * row_new[1] - col_vec[1] * row_new[0]
-        if cross * cross_new < 0:
-            row_new = -row_new
-        phisat_src_transform = Affine(
-            col_vec[0], row_new[0], phisat_src_transform.c,
-            col_vec[1], row_new[1], phisat_src_transform.f,
-        )
-        logger.info(
-            "Applied PhiSat isotropic transform correction for matching (anisotropy %.2f)",
-            anisotropy,
-        )
-
+    # 2. Calculate Bounds
     phisat_corners = [
         (0.0, 0.0),
         (float(phisat_ds.width), 0.0),
@@ -96,19 +161,15 @@ def create_independent_scaled_grids(
     ]
     phisat_world = [phisat_src_transform * c for c in phisat_corners]
     phi_xs, phi_ys = zip(*phisat_world)
+    
     phi_bounds = transform_bounds(
-        phisat_ds.crs,
-        common_crs,
-        min(phi_xs), min(phi_ys), max(phi_xs), max(phi_ys),
-        densify_pts=21,
+        phisat_ds.crs, common_crs, min(phi_xs), min(phi_ys), max(phi_xs), max(phi_ys), densify_pts=21
     )
     sen_bounds = transform_bounds(
-        sentinel_ds.crs,
-        common_crs,
-        *sentinel_ds.bounds,
-        densify_pts=21,
+        sentinel_ds.crs, common_crs, *sentinel_ds.bounds, densify_pts=21
     )
 
+    # 3. Check Overlap
     inter_left = max(phi_bounds[0], sen_bounds[0])
     inter_bottom = max(phi_bounds[1], sen_bounds[1])
     inter_right = min(phi_bounds[2], sen_bounds[2])
@@ -117,11 +178,7 @@ def create_independent_scaled_grids(
     if inter_right <= inter_left or inter_top <= inter_bottom:
         raise ValueError("No overlap between PhiSat and Sentinel after CRS harmonization")
 
-    union_left = min(phi_bounds[0], sen_bounds[0])
-    union_bottom = min(phi_bounds[1], sen_bounds[1])
-    union_right = max(phi_bounds[2], sen_bounds[2])
-    union_top = max(phi_bounds[3], sen_bounds[3])
-
+    # 4. Calculate Resolution Target
     phi_res_x = abs((phi_bounds[2] - phi_bounds[0]) / max(1, phisat_ds.width))
     phi_res_y = abs((phi_bounds[3] - phi_bounds[1]) / max(1, phisat_ds.height))
     sen_res_x = abs((sen_bounds[2] - sen_bounds[0]) / max(1, sentinel_ds.width))
@@ -130,15 +187,12 @@ def create_independent_scaled_grids(
     target_res = max(phi_res_x, phi_res_y, sen_res_x, sen_res_y)
     max_target_res_m = 20.0
     if target_res > max_target_res_m:
-        logger.info(
-            "Capping coarse target resolution from %.3f to %.3f for matching",
-            target_res,
-            max_target_res_m,
-        )
+        logger.info("Capping coarse target resolution from %.3f to %.3f for matching", target_res, max_target_res_m)
         target_res = max_target_res_m
+        
     pad = max(0, margin_pixels) * target_res
 
-    # PhiSat grid: just its own coordinates, slightly padded.
+    # 5. Define Output Grids
     phi_left, phi_bottom, phi_right, phi_top = phi_bounds
     phi_left -= pad; phi_right += pad
     phi_bottom -= pad; phi_top += pad
@@ -146,68 +200,20 @@ def create_independent_scaled_grids(
     phi_target_w = int(np.ceil((phi_right - phi_left) / target_res))
     phi_target_h = int(np.ceil((phi_top - phi_bottom) / target_res))
 
-    # Sentinel grid: the FULL Sentinel image, no clipping.
     sen_left, sen_bottom, sen_right, sen_top = sen_bounds
-    
     sen_target_w = int(np.ceil((sen_right - sen_left) / target_res))
     sen_target_h = int(np.ceil((sen_top - sen_bottom) / target_res))
 
     phi_common_transform = from_origin(phi_left, phi_top, target_res, target_res)
     sen_common_transform = from_origin(sen_left, sen_top, target_res, target_res)
     
-    logger.info(
-        "PhiSat grid: size=%dx%d | Sentinel grid: size=%dx%d",
-        phi_target_w,
-        phi_target_h,
-        sen_target_w,
-        sen_target_h,
-    )
+    logger.info("PhiSat grid: size=%dx%d | Sentinel grid: size=%dx%d", phi_target_w, phi_target_h, sen_target_w, sen_target_h)
     
-    def reproject_img(src_img, src_ds, src_transform, dst_transform, target_w, target_h, dst_crs):
-        out = np.zeros((3, target_h, target_w), dtype=np.float32)
-        src = src_img if src_img.ndim == 3 else np.stack([src_img]*3, axis=-1)
-            
-        channels = [0, 1, 2] if src.shape[2] >= 3 else [0]
-        for i, channel_idx in enumerate(channels):
-            dst_idx = i if len(channels) > 1 else 0
-            reproject(
-                source=src[..., channel_idx].astype(np.float32),
-                destination=out[dst_idx],
-                src_transform=src_transform,
-                src_crs=src_ds.crs,
-                dst_transform=dst_transform,
-                dst_crs=dst_crs,
-                resampling=Resampling.bilinear,
-                src_nodata=0,
-                dst_nodata=0,
-                init_dest_nodata=True,
-            )
-            if len(channels) == 1:
-                out[1] = out[0]
-                out[2] = out[0]
-
-        valid = np.zeros((target_h, target_w), dtype=np.uint8)
-        reproject(
-            source=np.ones((src_ds.height, src_ds.width), dtype=np.uint8),
-            destination=valid,
-            src_transform=src_transform,
-            src_crs=src_ds.crs,
-            dst_transform=dst_transform,
-            dst_crs=dst_crs,
-            resampling=Resampling.nearest,
-            src_nodata=0,
-            dst_nodata=0,
-            init_dest_nodata=True,
-        )
-                
-        out = np.clip(out, 0, 255).astype(np.uint8).transpose((1, 2, 0))
-        return out, valid > 0
-
-    # Project both to the new independent 10m shared grid
-    phisat_aligned, phisat_valid = reproject_img(
+    # 6. Reproject Both
+    phisat_aligned, phisat_valid = _reproject_image(
         phisat_img, phisat_ds, phisat_src_transform, phi_common_transform, phi_target_w, phi_target_h, common_crs
     )
-    sentinel_aligned, sentinel_valid = reproject_img(
+    sentinel_aligned, sentinel_valid = _reproject_image(
         sentinel_img, sentinel_ds, sentinel_ds.transform, sen_common_transform, sen_target_w, sen_target_h, common_crs
     )
 
@@ -218,18 +224,23 @@ def create_independent_scaled_grids(
 
 # ── RANSAC filter ──────────────────────────────────────────────────────
 
-def ransac_filter(kp0: np.ndarray, kp1: np.ndarray,
-                  threshold: float = 8.0
-                  ) -> Tuple[np.ndarray, np.ndarray]:
-    """Filter matches with RANSAC homography.  Returns inlier arrays."""
+def ransac_filter(
+    kp0: np.ndarray,
+    kp1: np.ndarray,
+    confidence: Optional[np.ndarray] = None,
+    threshold: float = 8.0,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Filter matches with RANSAC homography. Returns inlier arrays (and confidence if provided)."""
     if len(kp0) < 4:
-        return kp0, kp1
+        return kp0, kp1, confidence
     H, mask = cv2.findHomography(kp0, kp1, cv2.RANSAC, threshold,
                                  confidence=0.99999)
     if mask is not None:
         m = mask.ravel().astype(bool)
-        return kp0[m], kp1[m]
-    return kp0, kp1
+        if confidence is not None:
+            return kp0[m], kp1[m], confidence[m]
+        return kp0[m], kp1[m], None
+    return kp0, kp1, confidence
 
 
 # ── Match visualizer ──────────────────────────────────────────────────
@@ -369,7 +380,7 @@ def run_matching(config: SceneConfig,
     logger.info("  Debug images → %s", config.output_dir)
 
     # 4. Match (using a sliding window over the massive Sentinel image)
-    device = "cpu" #"cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     matcher = get_matcher(matcher_name, device=device,
                           max_keypoints=config.max_keypoints)
     
@@ -383,6 +394,7 @@ def run_matching(config: SceneConfig,
     
     all_kp0 = []
     all_kp1 = []
+    all_conf = []
     
     logger.info("Matching via sliding window (window %dx%d, sentinel %dx%d)...", phi_w, phi_h, sen_w, sen_h)
     
@@ -406,6 +418,7 @@ def run_matching(config: SceneConfig,
                 
                 if len(res["keypoints0"]) > 0:
                     all_kp0.append(res["keypoints0"])
+                    all_conf.append(res["confidence"])
                     
                     # Shift Sentinel keypoints back to full-image coordinates
                     shifted_kp1 = res["keypoints1"] + np.array([[x_start, y_start]])
@@ -414,14 +427,24 @@ def run_matching(config: SceneConfig,
     if all_kp0:
         kp0 = np.concatenate(all_kp0, axis=0)
         kp1 = np.concatenate(all_kp1, axis=0)
+        conf = np.concatenate(all_conf, axis=0)
     else:
-        kp0, kp1 = np.empty((0, 2)), np.empty((0, 2))
+        kp0, kp1, conf = np.empty((0, 2)), np.empty((0, 2)), np.empty(0)
         
     logger.info("Raw matches (accumulated): %d", len(kp0))
 
     # 5. RANSAC
-    kp0, kp1 = ransac_filter(kp0, kp1)
+    kp0, kp1, conf = ransac_filter(kp0, kp1, conf)
     logger.info("After RANSAC: %d", len(kp0))
+
+    max_saved_matches = 10000
+    if len(kp0) > max_saved_matches:
+        best_idx = np.argsort(conf)[-max_saved_matches:]
+        best_idx = best_idx[np.argsort(conf[best_idx])[::-1]]
+        kp0 = kp0[best_idx]
+        kp1 = kp1[best_idx]
+        conf = conf[best_idx]
+        logger.info("Keeping top %d matches by confidence", max_saved_matches)
 
     if len(kp0) == 0:
         logger.warning("No matches found!")
