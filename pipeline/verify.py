@@ -468,6 +468,8 @@ def _compute_stats(results: List[dict]) -> dict:
             **_axis(total),
             "median":    float(np.median(total)),
             "median_px": float(np.median(total) / PIXEL_SIZE),
+            "ce90":      float(1.5175 * np.sqrt(np.mean(east**2) + np.mean(north**2))),
+            "ce90_px":   float(1.5175 * np.sqrt(np.mean(east**2) + np.mean(north**2)) / PIXEL_SIZE),
             "max":       float(np.max(total)),
             "min":       float(np.min(total)),
         },
@@ -533,6 +535,7 @@ def _print_stats(stats: dict, meta: dict, method_label: str) -> None:
     logger.info("\n  Total 2-D:")
     logger.info(f"    Mean   : {t['mean']:8.2f} m  ({t['mean']/ps:6.2f} px)")
     logger.info(f"    Median : {t['median']:8.2f} m  ({t['median_px']:6.2f} px)")
+    logger.info(f"    CE90   : {t['ce90']:8.2f} m  ({t['ce90_px']:6.2f} px)")
     logger.info(f"    RMSE   : {t['rmse']:8.2f} m  ({t['rmse_px']:6.2f} px)")
     logger.info(f"    Max    : {t['max']:8.2f} m     Min : {t['min']:.2f} m")
 
