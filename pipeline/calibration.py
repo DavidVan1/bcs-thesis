@@ -119,7 +119,7 @@ def run_calibration(config: SceneConfig,
     res1 = least_squares(
         _residuals, x0, args=(model, all_points),
         bounds=(lower, upper),
-        loss="linear", f_scale=100.0,
+        loss="soft_l1", f_scale=100.0,
         verbose=2 if verbose else 0,
     )
 
