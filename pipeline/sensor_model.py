@@ -7,7 +7,7 @@ Inverse model:  (lon, lat) → pixel (px, py)  (via Newton-Raphson)
 
 Supports:
 - Pushbroom geometry (time-dependent position per scanline)
-- Ray–sphere intersection with spherical Earth
+- Ray–ellipsoid intersection with WGS84 Earth
 - LVLH orbital frame
 - Mounting bias (roll, pitch, yaw)
 - Radial distortion (k1, k2)
@@ -28,7 +28,9 @@ logger = logging.getLogger(__name__)
 # Base pushbroom model
 # ═══════════════════════════════════════════════════════════════════════════
 
-R_EARTH = 6_371_000.0  # metres (spherical approximation)
+WGS84_A = 6_378_137.0
+WGS84_B = 6_356_752.3142
+WGS84_E2 = 1.0 - (WGS84_B * WGS84_B) / (WGS84_A * WGS84_A)
 
 
 class PhiSatPushbroomModel:
@@ -161,19 +163,36 @@ class PhiSatPushbroomModel:
 
         ray_world = R_o2e @ R_b2o @ ray_cam
 
-        return _intersect_sphere(sat_pos, ray_world,
-                                 R_EARTH + ground_height)
+        return _intersect_ellipsoid(sat_pos, ray_world,
+                        WGS84_A + ground_height,
+                        WGS84_B + ground_height)
 
     # ── ECEF ↔ geodetic ────────────────────────────────────────────
 
     @staticmethod
     def ecef_to_lonlat(x: float, y: float,
                        z: float) -> Tuple[float, float, float]:
-        """ECEF → (lon, lat, height) using spherical approximation."""
-        r = np.sqrt(x*x + y*y + z*z)
-        lat = np.degrees(np.arcsin(z / r))
+        """ECEF → (lon, lat, height) using WGS84 ellipsoid."""
         lon = np.degrees(np.arctan2(y, x))
-        return lon, lat, r - R_EARTH
+
+        p = np.sqrt(x * x + y * y)
+        lat = np.arctan2(z, p * (1.0 - WGS84_E2))
+
+        for _ in range(10):
+            sin_lat = np.sin(lat)
+            N = WGS84_A / np.sqrt(1.0 - WGS84_E2 * sin_lat * sin_lat)
+            h = p / np.cos(lat) - N
+            lat_next = np.arctan2(z, p * (1.0 - WGS84_E2 * N / (N + h)))
+            if abs(lat_next - lat) < 1e-12:
+                lat = lat_next
+                break
+            lat = lat_next
+
+        sin_lat = np.sin(lat)
+        N = WGS84_A / np.sqrt(1.0 - WGS84_E2 * sin_lat * sin_lat)
+        h = p / np.cos(lat) - N
+
+        return lon, np.degrees(lat), h
 
     # ── Convenience ─────────────────────────────────────────────────
 
@@ -271,28 +290,39 @@ class RobustModel(PhiSatPushbroomModel):
         R_o2e = self.get_orbital_rotation_matrix(sat_pos, self.velocity)
 
         ray_world = R_o2e @ R_b2o @ ray_body
-        return _intersect_sphere(sat_pos, ray_world, R_EARTH)
+        return _intersect_ellipsoid(sat_pos, ray_world, WGS84_A, WGS84_B)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Private helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _intersect_sphere(origin: np.ndarray, direction: np.ndarray,
-                      radius: float) -> Optional[np.ndarray]:
-    """Ray–sphere intersection.  Returns ECEF point or None."""
-    a = np.dot(direction, direction)
-    b = 2.0 * np.dot(origin, direction)
-    c = np.dot(origin, origin) - radius * radius
-    disc = b * b - 4.0 * a * c
+def _intersect_ellipsoid(origin: np.ndarray, direction: np.ndarray,
+                         a: float, b: float) -> Optional[np.ndarray]:
+    """Ray–ellipsoid intersection. Returns ECEF point or None."""
+    dx, dy, dz = direction
+    ox, oy, oz = origin
+
+    a2 = a * a
+    b2 = b * b
+
+    A = (dx * dx + dy * dy) / a2 + (dz * dz) / b2
+    B = 2.0 * ((ox * dx + oy * dy) / a2 + (oz * dz) / b2)
+    C = (ox * ox + oy * oy) / a2 + (oz * oz) / b2 - 1.0
+
+    disc = B * B - 4.0 * A * C
     if disc < 0:
         return None
+
     sqrt_disc = np.sqrt(disc)
-    u1 = (-b - sqrt_disc) / (2.0 * a)
-    u2 = (-b + sqrt_disc) / (2.0 * a)
-    u = u1 if u1 > 0 else u2
-    if u <= 0:
+    u1 = (-B - sqrt_disc) / (2.0 * A)
+    u2 = (-B + sqrt_disc) / (2.0 * A)
+
+    candidates = [u for u in (u1, u2) if u > 0]
+    if not candidates:
         return None
+
+    u = min(candidates)
     return origin + u * direction
 
 
