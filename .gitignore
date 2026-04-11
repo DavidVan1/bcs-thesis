@@ -4,6 +4,7 @@
 !/third_party/
 !/environment.yml
 
+*.md
 scenes.json
 
 __pycache__/

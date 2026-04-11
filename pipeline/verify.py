@@ -363,10 +363,7 @@ def extract_reference_chip_from_raster(
         chip_shape: Tuple[int, int] = (57, 57),
         chip_res: float = 10.0,
 ) -> Optional[np.ndarray]:
-    """Extract a reference chip from an arbitrary raster in a target UTM grid.
-
-    Used for `reference_source='us_naip'`, where no pre-tiled ESA chips exist.
-    """
+    """Extract a reference chip from an arbitrary raster in a target UTM grid."""
     h, w = chip_shape
     half_w = 0.5 * w * chip_res
     half_h = 0.5 * h * chip_res
@@ -677,21 +674,12 @@ def verify_ncc(config: SceneConfig,
     gcps, meta = _select_gcps(config, ob, ortho_data, ortho_crs, ortho_tf,
                               require_chip=require_chip)
 
-    if reference_source not in ("sentinel", "us_naip"):
-        raise ValueError("reference_source must be 'sentinel' or 'us_naip'")
+    if reference_source != "sentinel":
+        raise ValueError("reference_source must be 'sentinel'")
 
     if not gcps:
         logger.info("  No usable GCPs for selected reference source.")
         return dict(results=[], stats={}, meta=meta)
-
-    us_ref_path = None
-    if reference_source == "us_naip":
-        if config.us_national_ortho_path is None or not config.us_national_ortho_path.exists():
-            raise FileNotFoundError(
-                "US NAIP reference requested but not found. "
-                "Run fetch first or set config.us_national_ortho."
-            )
-        us_ref_path = str(config.us_national_ortho_path)
 
     work_res = PIXEL_SIZE
 
@@ -708,40 +696,12 @@ def verify_ncc(config: SceneConfig,
 
     for gcp in gcps:
         gid = gcp["id"]
-        if reference_source == "sentinel":
-            with rasterio.open(gcp["chip_path"]) as cs:
-                chip_data = cs.read(1).astype(np.float32)
-                chip_crs  = cs.crs
-                chip_bounds = cs.bounds
-                chip_res  = abs(cs.transform.a)
-                chip_shape = cs.shape
-        else:
-            chip_res = 10.0
-            chip_shape = (57, 57)
-            chip_crs = CRS.from_epsg(int(gcp["epsg"]))
-            half_w = 0.5 * chip_shape[1] * chip_res
-            half_h = 0.5 * chip_shape[0] * chip_res
-            chip_bounds = BoundingBox(
-                left=gcp["x_utm"] - half_w,
-                bottom=gcp["y_utm"] - half_h,
-                right=gcp["x_utm"] + half_w,
-                top=gcp["y_utm"] + half_h,
-            )
-            chip_data = extract_reference_chip_from_raster(
-                us_ref_path,
-                center_e=gcp["x_utm"],
-                center_n=gcp["y_utm"],
-                chip_crs=chip_crs,
-                chip_shape=chip_shape,
-                chip_res=chip_res,
-            )
-            if chip_data is None:
-                skipped += 1
-                logger.info(
-                    f"{gid:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
-                    f"{gcp['quality']:2d}  "
-                    f"{'— no US reference coverage —':>42s}")
-                continue
+        with rasterio.open(gcp["chip_path"]) as cs:
+            chip_data = cs.read(1).astype(np.float32)
+            chip_crs  = cs.crs
+            chip_bounds = cs.bounds
+            chip_res  = abs(cs.transform.a)
+            chip_shape = cs.shape
 
         # ── Pass 1: coarse (wide search) ─────────────────────────────
         dy1, dx1, ncc1, edge1, no_data1, chip_up = _single_pass_ncc(
@@ -895,17 +855,10 @@ def run_verification(config: SceneConfig,
     min_ncc : float
         NCC threshold for method B.
     """
-    if reference_source == "sentinel":
-        missing = config.check_inputs("verify")
-    else:
-        missing = []
-        if config.ortho_path is None or not config.ortho_path.exists():
-            missing.append(f"Ortho GeoTIFF: {config.ortho_path}")
-        if config.gcp_json_path is None or not config.gcp_json_path.exists():
-            missing.append(f"GCP JSON: {config.gcp_json_path}")
-        if (config.us_national_ortho_path is None
-                or not config.us_national_ortho_path.exists()):
-            missing.append(f"US national ortho: {config.us_national_ortho_path}")
+    if reference_source != "sentinel":
+        raise ValueError("reference_source must be 'sentinel'")
+
+    missing = config.check_inputs("verify")
 
     if missing:
         raise FileNotFoundError(

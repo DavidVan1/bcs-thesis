@@ -6,7 +6,6 @@ Given only the phisat folder (AOCS.json + GL_scene_0.json), downloads:
   1. Sentinel-2 L1C imagery  – Google Earth Engine (COPERNICUS/S2_HARMONIZED)
   2. Copernicus DEM GLO-30    – Google Earth Engine (COPERNICUS/DEM/GLO30)
   3. Copernicus GCP database  – ESA S2 GRI HTTPS tiles
-  4. US national ortho (optional, US only) – USDA NAIP via Google Earth Engine
 
 Usage (CLI):
     python -m pipeline.run <scene> fetch
@@ -27,7 +26,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import re
 import shutil
@@ -38,6 +36,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
+import math
 
 from .config import SceneConfig, PROJECT_ROOT
 
@@ -376,7 +375,7 @@ def download_dem(
     output_path: Path,
     *,
     scale_m: float = 30.0,
-    region_buffer_m: float = 80000.0,
+    region_buffer_m: float = 60000.0,
 ) -> Path:
     """
     Download Copernicus GLO-30 DEM for the footprint from Google Earth Engine.
@@ -423,112 +422,6 @@ def download_dem(
     )
     logger.info("  Saved: %s", output_path)
     return output_path
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# US national mapping (NAIP) via Google Earth Engine
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _bbox_is_us(lon_min: float, lat_min: float,
-                lon_max: float, lat_max: float) -> bool:
-    """Heuristic test for U.S. coverage (CONUS + Alaska + Hawaii + PR)."""
-    c_lon = 0.5 * (lon_min + lon_max)
-    c_lat = 0.5 * (lat_min + lat_max)
-    return (-170.0 <= c_lon <= -60.0) and (18.0 <= c_lat <= 72.0)
-
-
-def download_us_national_ortho(
-    lon_min: float, lat_min: float,
-    lon_max: float, lat_max: float,
-    acq_date: Optional[str],
-    output_dir: Path,
-    *,
-    scale_m: float = 2.0,
-    max_raw_gb: float = 2.5,
-) -> Optional[Path]:
-    """
-    Download a USDA NAIP ortho mosaic (RGB) for the AOI.
-
-    NAIP is a free U.S. national aerial ortho source, suitable as an
-    independent high-resolution reference layer for validation.
-    """
-    if not _bbox_is_us(lon_min, lat_min, lon_max, lat_max):
-        logger.info("  US national mapping skipped (footprint outside U.S.).")
-        return None
-
-    try:
-        _ensure_gee_initialized()
-        import ee
-        from geedim.mask import BaseImage
-    except (ImportError, RuntimeError):
-        logger.info("  US national mapping skipped: missing earthengine-api/geedim or not authenticated")
-        return None
-
-    region = ee.Geometry.Rectangle([lon_min, lat_min, lon_max, lat_max])
-
-    # Estimate raw RGB uint8 size and auto-coarsen scale when too large.
-    # This avoids accidental 10+ GB exports for big AOIs at 1 m.
-    lat_c = 0.5 * (lat_min + lat_max)
-    m_per_deg_lat = 111_132.0
-    m_per_deg_lon = 111_320.0 * max(math.cos(math.radians(lat_c)), 1e-6)
-    width_m = max((lon_max - lon_min) * m_per_deg_lon, 1.0)
-    height_m = max((lat_max - lat_min) * m_per_deg_lat, 1.0)
-
-    eff_scale = float(scale_m)
-    raw_bytes = (width_m / eff_scale) * (height_m / eff_scale) * 3.0
-    raw_gb = raw_bytes / 1e9
-    if raw_gb > max_raw_gb:
-        factor = math.sqrt(raw_gb / max_raw_gb)
-        eff_scale *= factor
-        raw_bytes = (width_m / eff_scale) * (height_m / eff_scale) * 3.0
-        raw_gb = raw_bytes / 1e9
-        logger.warning(
-            "  NAIP AOI is large; auto-adjusting scale to %.2f m "
-            "(estimated raw %.2f GB)", eff_scale, raw_gb)
-
-    # Prefer acquisition-year ±2y; fallback to full archive latest mosaic.
-    naip = ee.ImageCollection("USDA/NAIP/DOQQ").filterBounds(region)
-
-    import datetime
-    year_tag = "latest"
-    if acq_date:
-        try:
-            y = datetime.datetime.strptime(acq_date, "%Y-%m-%d").year
-            start = f"{max(2003, y-2)}-01-01"
-            end = f"{y+2}-12-31"
-            cand = naip.filterDate(start, end)
-            if cand.size().getInfo() > 0:
-                naip = cand
-                year_tag = f"{max(2003, y-2)}_{y+2}"
-        except Exception:
-            pass
-
-    count = naip.size().getInfo()
-    if count == 0:
-        logger.info("  US national mapping skipped: no NAIP imagery found for AOI")
-        return None
-
-    # Cloud-free aerial ortho; use median to smooth seam differences.
-    img = naip.select(["R", "G", "B"]).median().clip(region).toUint8()
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out_tif = output_dir / f"us_naip_{year_tag}.tif"
-    if out_tif.exists():
-        logger.info("  US national ortho already exists — skipping: %s", out_tif.name)
-        return out_tif
-
-    logger.info("  US national ortho (NAIP): %d tile(s) -> %s", count, out_tif.name)
-    gd_img = BaseImage(img)
-    gd_img.download(
-        str(out_tif),
-        region=region,
-        scale=eff_scale,
-        crs="EPSG:4326",
-        dtype="uint8",
-        overwrite=True,
-    )
-    logger.info("  Saved US national ortho: %s", out_tif)
-    return out_tif
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -700,8 +593,7 @@ def download_gcps(
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_fetch(config: SceneConfig, *,
-              no_gcp_chips: bool = False,
-              fetch_us_mapping: bool = True) -> None:
+              no_gcp_chips: bool = False) -> None:
     """
     Download Sentinel-2, DEM, and GCP data for a scene.
 
@@ -787,26 +679,7 @@ def run_fetch(config: SceneConfig, *,
         logger.error("  GCP download failed: %s", e)
         logger.error("    You can download manually from https://s2gri.copernicus.eu/")
 
-    # ── 5. US national mapping (optional, US-only) ─────────────────
-    if fetch_us_mapping:
-        us_out_dir = PROJECT_ROOT / "national" / f"us_{config.name}"
-        # NAIP fetch does not need the large Sentinel/DEM margin.
-        n_lon_min, n_lat_min, n_lon_max, n_lat_max = _expand_bbox(
-            lon_min, lat_min, lon_max, lat_max, margin_deg=0.02)
-        try:
-            us_path = download_us_national_ortho(
-                n_lon_min, n_lat_min, n_lon_max, n_lat_max,
-                acq_date=acq_date,
-                output_dir=us_out_dir,
-            )
-            if us_path is not None:
-                config.us_national_ortho = str(us_path.relative_to(PROJECT_ROOT))
-                logger.info("  US national ortho : %s", config.us_national_ortho)
-        except Exception as e:
-            logger.error("  US national mapping fetch failed: %s", e)
-            logger.info("    Continuing without US national ortho.")
-
-    # ── 6. Print config suggestion ──────────────────────────────────
+    # ── 5. Print config suggestion ──────────────────────────────────
     _find_phisat_image(config)
 
     logger.info("=" * 60)
