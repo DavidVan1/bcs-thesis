@@ -194,7 +194,7 @@ def download_sentinel(
     max_cloud_pct: float = 5.0,
     min_coverage: float = 0.68,
     scale_m: float = 10.0,
-    region_buffer_m: float = 50000.0,
+    region_buffer_m: float = 5000.0,
     clip_to_region: bool = False,
 ) -> Path:
     """
