@@ -211,8 +211,8 @@ def run_orthorectify_rpc(config: SceneConfig,
     missing = []
     if config.phisat_image_path is None or not config.phisat_image_path.exists():
         missing.append(f"PhiSat image: {config.phisat_image_path}")
-    if config.aocs_path is None or not config.aocs_path.exists():
-        missing.append(f"AOCS: {config.aocs_path}")
+    # if config.aocs_path is None or not config.aocs_path.exists():
+    #     missing.append(f"AOCS: {config.aocs_path}")
     if config.dem_path is None or not config.dem_path.exists():
         missing.append(f"DEM: {config.dem_path}")
     if missing:
@@ -226,10 +226,6 @@ def run_orthorectify_rpc(config: SceneConfig,
     logger.info("=" * 60)
     logger.info("ORTHORECTIFY (RPC) — scene '%s'", config.name)
     logger.info("=" * 60)
-
-    with rasterio.open(str(config.phisat_image_path)) as src:
-        image_width = src.width
-        image_height = src.height
 
     with open(rpc_path) as f:
         rpc_payload = json.load(f)
