@@ -19,7 +19,7 @@ verify          Independent GCP verification via cross-correlation
 run             CLI entry point and pipeline orchestrator
 
 Pipeline stages (in order):
-    fetch -> match -> calibrate -> orthorectify -> verify
+    fetch -> match -> calibrate -> rpc_fit -> orthorectify -> verify
 """
 
 from .config import SceneConfig, get_scene_config, list_scenes
