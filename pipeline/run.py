@@ -10,6 +10,7 @@ Examples:
     python -m pipeline.run sf match                # Matching only
     python -m pipeline.run sf match --matcher xoftr
     python -m pipeline.run la calibrate
+    python -m pipeline.run la rpc_fit
     python -m pipeline.run sf orthorectify
     python -m pipeline.run sf verify
 
@@ -45,7 +46,7 @@ MATCHER_CHOICES: Sequence[str] = (
 
 # Ordered sequence of stages in their natural pipeline order.
 PIPELINE_ORDER: Sequence[str] = (
-    "fetch", "match", "calibrate", "orthorectify", "verify",
+    "fetch", "match", "calibrate", "rpc_fit", "orthorectify", "verify",
 )
 
 # Valid CLI stage names (includes "all").
@@ -64,7 +65,9 @@ class StageContext:
     verify_method: str = "ncc"
     reference_source: str = "sentinel"
     no_gcp_chips: bool = False
-    fetch_us_mapping: bool = True
+    rpc_grid_size: int = 80
+    rpc_output: Optional[str] = None
+    rpc_json: Optional[str] = None
     profile: bool = False
 
 
@@ -90,8 +93,7 @@ def _run_fetch(ctx: StageContext) -> None:
     """Download Sentinel-2, DEM and GCPs from Google Earth Engine / Copernicus."""
     from .fetch import run_fetch
     run_fetch(ctx.config,
-              no_gcp_chips=ctx.no_gcp_chips,
-              fetch_us_mapping=ctx.fetch_us_mapping)
+              no_gcp_chips=ctx.no_gcp_chips)
 
 
 @register_stage("match")
@@ -108,11 +110,28 @@ def _run_calibrate(ctx: StageContext) -> None:
     run_calibration(ctx.config, verbose=True)
 
 
+@register_stage("rpc_fit")
+def _run_rpc_fit(ctx: StageContext) -> None:
+    """Fit RPC model from calibrated rigorous geometry."""
+    from .rpc_fit import fit_rpc
+    fit_rpc(
+        scene=ctx.config.name,
+        matcher=ctx.matcher_name,
+        grid_size=ctx.rpc_grid_size,
+        output_path=ctx.rpc_output,
+    )
+
+
 @register_stage("orthorectify")
 def _run_orthorectify(ctx: StageContext) -> None:
     """Run the orthorectification stage."""
-    from .orthorectify import run_orthorectify
-    run_orthorectify(ctx.config)
+    from .orthorectify import run_orthorectify_rpc
+    if not ctx.rpc_json:
+        raise ValueError("orthorectify requires an RPC JSON path")
+    run_orthorectify_rpc(
+        ctx.config,
+        rpc_json_path=ctx.rpc_json,
+    )
 
 
 @register_stage("verify")
@@ -256,21 +275,15 @@ def main() -> None:
         help="Skip downloading GCP reference chips during fetch.",
     )
     parser.add_argument(
-        "--no-us-mapping", action="store_true",
-        help="Skip downloading free US national mapping ortho (NAIP) during fetch.",
-    )
-    parser.add_argument(
         "--verify-method", type=str, default="ncc",
         choices=["all", "ncc"],
         help="Verification method: 'ncc'. 'all' is kept as a compatibility alias. Default: ncc.",
     )
     parser.add_argument(
         "--reference-source", type=str, default="sentinel",
-        choices=["sentinel", "us_naip"],
+        choices=["sentinel"],
         help=(
-            "Reference source for NCC verification: 'sentinel' uses ESA GCP "
-            "chips, 'us_naip' uses fetched US national ortho patches. "
-            "Default: sentinel."
+            "Reference source for NCC verification. Default: sentinel."
         ),
     )
     parser.add_argument(
@@ -280,7 +293,24 @@ def main() -> None:
             "for each stage and save to outputs/<scene>/resource_profile.json."
         ),
     )
-
+    parser.add_argument(
+        "--rpc-json", type=str, default=None, metavar="PATH",
+        help=(
+            "Path to RPC JSON (GDAL-style keys). If omitted, defaults to "
+            "outputs/<scene>/rpc_<matcher>.json"
+        ),
+    )
+    parser.add_argument(
+        "--rpc-grid-size", type=int, default=80,
+        help="Sampling grid size per axis used by rpc_fit stage. Default: 80.",
+    )
+    parser.add_argument(
+        "--rpc-output", type=str, default=None, metavar="PATH",
+        help=(
+            "Output RPC JSON path used by rpc_fit stage. If omitted, defaults to "
+            "outputs/<scene>/rpc_<matcher>.json"
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -303,13 +333,19 @@ def main() -> None:
     config = _build_config(args)
     config.set_matcher(args.matcher)
 
+    default_rpc_path = str(config.output_dir / f"rpc_{args.matcher}.json")
+    rpc_output = args.rpc_output or default_rpc_path
+    rpc_json = args.rpc_json or rpc_output
+
     ctx = StageContext(
         config=config,
         matcher_name=args.matcher,
         verify_method=args.verify_method,
         reference_source=args.reference_source,
         no_gcp_chips=getattr(args, "no_gcp_chips", False),
-        fetch_us_mapping=not getattr(args, "no_us_mapping", False),
+        rpc_grid_size=getattr(args, "rpc_grid_size", 80),
+        rpc_output=rpc_output,
+        rpc_json=rpc_json,
         profile=getattr(args, "profile", False),
     )
 
