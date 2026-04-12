@@ -53,14 +53,9 @@ def _fit_rational_rpc_component(target_n: np.ndarray, terms: np.ndarray) -> tupl
     den[1:] = coeff[20:]
     return num, den
 
-def _get_synthetic_height_levels(cfg, n_levels: int = 7) -> np.ndarray:
-    """Return stable synthetic height levels for RPC training.
-
-    Heights are scene-adaptive when DEM data are available, but only via
-    aggregate statistics (no per-sample DEM queries). If valid DEM pixels are
-    unavailable, a conservative fallback range is used.
-    """
-    fallback = np.linspace(-500.0, 5000.0, n_levels, dtype=np.float64)
+def _get_dem_height_range(cfg) -> tuple[float, float]:
+    """Return (h_min, h_max) from DEM valid pixels for the whole scene."""
+    fallback = (-500.0, 5000.0)
 
     dem_path = cfg.dem_path
     if dem_path is None or not dem_path.exists():
@@ -76,18 +71,15 @@ def _get_synthetic_height_levels(cfg, n_levels: int = 7) -> np.ndarray:
         if finite_dem.size < 100:
             return fallback
 
-        # Robust central terrain span: avoid outliers/edge artifacts.
-        h_lo = float(np.percentile(finite_dem, 5.0))
-        h_hi = float(np.percentile(finite_dem, 95.0))
+        h_lo = float(np.min(finite_dem))
+        h_hi = float(np.max(finite_dem))
         if not (np.isfinite(h_lo) and np.isfinite(h_hi)):
             return fallback
 
         if h_hi <= h_lo:
             return fallback
 
-        # Small margins keep support beyond central quantiles.
-        margin = max(25.0, 0.05 * (h_hi - h_lo))
-        return np.linspace(h_lo - margin, h_hi + margin, n_levels, dtype=np.float64)
+        return h_lo, h_hi
     except Exception:
         return fallback
 
@@ -99,12 +91,7 @@ def fit_rpc(
     grid_size: int = 64,
     output_path: str | None = None,
 ) -> Path:
-    """Fit an RPC JSON from forward rigorous sampling on synthetic height planes.
-
-    Samples are generated from a regular image grid replicated over five
-    evenly spaced synthetic heights. This avoids DEM queries during training
-    while preserving 3D variation needed by the rational model.
-    """
+    """Fit RPC coefficients from calibrated rigorous model and DEM height span."""
     cfg = get_scene_config(scene)
     cfg.set_matcher(matcher)
 
@@ -140,10 +127,11 @@ def fit_rpc(
     xs = np.linspace(0.0, image_w - 1.0, grid_size, dtype=np.float64)
     ys = np.linspace(0.0, image_h - 1.0, grid_size, dtype=np.float64)
 
-    # Synthetic 3D grid: exactly 5 evenly spaced height levels.
-    # Scene-adaptive when DEM statistics are available; no per-sample DEM query.
-    height_levels = _get_synthetic_height_levels(cfg, n_levels=5)
-    print(f"Using synthetic height levels: {height_levels}")
+    # 3D grid in DEM-derived global height range for this scene.
+    h_min, h_max = _get_dem_height_range(cfg)
+    height_levels = np.linspace(h_min, h_max, 5, dtype=np.float64)
+    print(f"Using DEM height range: [{h_min:.3f}, {h_max:.3f}] m")
+    print(f"Height levels: {height_levels}")
 
     u_list: list[float] = []
     v_list: list[float] = []
@@ -154,7 +142,9 @@ def fit_rpc(
     for h_i in height_levels:
         for v in ys:
             for u in xs:
-                ecef = model.predict_with_params(float(u), float(v), params)
+                ecef = model.predict_with_params(
+                    float(u), float(v), params, ground_height=float(h_i)
+                )
                 if ecef is None:
                     continue
 
