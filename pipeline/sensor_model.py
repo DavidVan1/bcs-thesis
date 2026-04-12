@@ -98,10 +98,6 @@ class PhiSatPushbroomModel:
         self.quaternion = np.array(acq["QPointing"])   # [w, x, y, z]
         self.t0 = acq["ADCSTimeSec"] + acq["ADCSTimeNs"] * 1e-9
 
-        # logger.info("Loaded AOCS metadata:")
-        # logger.info("  Position: %s", self.position)
-        # logger.info("  Velocity: %s", self.velocity)
-
     # ── Intrinsics ──────────────────────────────────────────────────
 
     def apply_radial_distortion(self, x: float,
