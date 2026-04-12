@@ -49,8 +49,7 @@ PARAM_UPPER: List[float] = [
 ]
 
 OUTLIER_SIGMA: float = 3.0
-DRIFT_WARNING_THRESHOLD: float = 0.5  # degrees
-METRES_PER_DEGREE_LAT: float = 111_132.0
+DRIFT_WARNING_THRESHOLD: float = 1  # degrees
 
 
 def _attach_dem_heights(config: SceneConfig,
