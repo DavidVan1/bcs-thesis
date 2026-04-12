@@ -90,9 +90,9 @@ class PhiSatPushbroomModel:
         self.quaternion = np.array(acq["QPointing"])   # [w, x, y, z]
         self.t0 = acq["ADCSTimeSec"] + acq["ADCSTimeNs"] * 1e-9
 
-        logger.info("Loaded AOCS metadata:")
-        logger.info("  Position: %s", self.position)
-        logger.info("  Velocity: %s", self.velocity)
+        # logger.info("Loaded AOCS metadata:")
+        # logger.info("  Position: %s", self.position)
+        # logger.info("  Velocity: %s", self.velocity)
 
     # ── Intrinsics ──────────────────────────────────────────────────
 
@@ -175,6 +175,19 @@ class PhiSatPushbroomModel:
         lon = np.degrees(np.arctan2(y, x))
         return lon, lat, r - R_EARTH
 
+    @staticmethod
+    def lonlat_to_ecef(lon: float, lat: float,
+                       height: float = 0.0) -> np.ndarray:
+        """(lon, lat, height) → ECEF using spherical approximation."""
+        lon_r = np.radians(lon)
+        lat_r = np.radians(lat)
+        r = R_EARTH + float(height)
+        clat = np.cos(lat_r)
+        x = r * clat * np.cos(lon_r)
+        y = r * clat * np.sin(lon_r)
+        z = r * np.sin(lat_r)
+        return np.array([x, y, z], dtype=np.float64)
+
     # ── Convenience ─────────────────────────────────────────────────
 
     def predict_ground_coordinates(self, px: float,
@@ -224,7 +237,8 @@ class RobustModel(PhiSatPushbroomModel):
     """
 
     def predict_with_params(self, px: float, py: float,
-                            params: np.ndarray) -> Optional[np.ndarray]:
+                            params: np.ndarray,
+                            ground_height: float = 0.0) -> Optional[np.ndarray]:
         """Forward-project a pixel using the current parameter vector."""
         t_shift, r, p, y = params[0], params[1], params[2], params[3]
         f_scale = params[4]
@@ -271,7 +285,7 @@ class RobustModel(PhiSatPushbroomModel):
         R_o2e = self.get_orbital_rotation_matrix(sat_pos, self.velocity)
 
         ray_world = R_o2e @ R_b2o @ ray_body
-        return _intersect_sphere(sat_pos, ray_world, R_EARTH)
+        return _intersect_sphere(sat_pos, ray_world, R_EARTH + float(ground_height))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
