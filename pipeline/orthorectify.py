@@ -1,12 +1,11 @@
 """
 DEM-aware orthorectification of PhiSat-2 pushbroom imagery.
 
-Pipeline:
-  1. Estimate image footprint from DEM-grid RPC validity.
-  2. Build a sparse lookup table (LUT) via RPC ground-to-image projection.
-  3. Interpolate LUT to full resolution.
-  4. Resample raw image with cv2.remap.
-  5. Write orthorectified GeoTIFF.
+This module wraps GDAL RPC warping:
+    1. Load the fitted RPC JSON.
+    2. Inject RPC metadata into a temporary VRT.
+    3. Warp the raw PhiSat image with gdalwarp using RPC + DEM.
+    4. Write the orthorectified GeoTIFF in a local UTM grid.
 """
 
 import logging
@@ -30,9 +29,6 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────
 TARGET_GSD_M: float = PHISAT_GSD_M     # output ground sample distance
-FOOTPRINT_MARGIN_DEG: float = 0.02     # degrees padding around footprint
-LUT_MIN_STEP: int = 10
-LUT_GRID_DIVISOR: int = 100             # max(dim) // this = step
 
 
 def _gdal_subprocess_env() -> dict:
@@ -138,7 +134,7 @@ def _build_rpc_vrt(src_path: Path, vrt_path: Path, rpc_payload: dict) -> None:
 def _gdal_rpc_orthorectify(config: SceneConfig, rpc_payload: dict) -> Optional[str]:
     """Orthorectify with GDAL RPC warp (+ DEM). Returns output path on success."""
     if shutil.which("gdalwarp") is None or shutil.which("gdal_translate") is None:
-        logger.warning("GDAL tools (gdalwarp/gdal_translate) not found; falling back to Python orthorectify")
+        logger.warning("GDAL tools (gdalwarp/gdal_translate) not found.")
         return None
 
     out_path = Path(config.ortho_path)
@@ -211,10 +207,10 @@ def run_orthorectify_rpc(config: SceneConfig,
     missing = []
     if config.phisat_image_path is None or not config.phisat_image_path.exists():
         missing.append(f"PhiSat image: {config.phisat_image_path}")
-    # if config.aocs_path is None or not config.aocs_path.exists():
-    #     missing.append(f"AOCS: {config.aocs_path}")
+
     if config.dem_path is None or not config.dem_path.exists():
         missing.append(f"DEM: {config.dem_path}")
+
     if missing:
         raise FileNotFoundError(
             "Missing files for orthorectify:\n  " + "\n  ".join(missing))
