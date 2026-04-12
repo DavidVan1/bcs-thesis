@@ -15,6 +15,8 @@ import logging
 from typing import Dict, List
 
 import numpy as np
+import rasterio
+from pyproj import Transformer
 from scipy.optimize import least_squares
 
 from .config import SceneConfig
@@ -51,32 +53,82 @@ DRIFT_WARNING_THRESHOLD: float = 0.5  # degrees
 METRES_PER_DEGREE_LAT: float = 111_132.0
 
 
+def _attach_dem_heights(config: SceneConfig,
+                        tie_points: List[Dict]) -> List[Dict]:
+    """Attach DEM elevation (metres) to each tie point as `height_m`."""
+    dem_path = config.dem_path
+    if dem_path is None or not dem_path.exists():
+        raise FileNotFoundError(f"DEM not found for calibration: {dem_path}")
+
+    if not tie_points:
+        return []
+
+    lons = [tp["lon"] for tp in tie_points]
+    lats = [tp["lat"] for tp in tie_points]
+
+    with rasterio.open(str(dem_path)) as dem_src:
+        if dem_src.crs is None:
+            raise ValueError(f"DEM has no CRS: {dem_path}")
+
+        to_dem = Transformer.from_crs("EPSG:4326", dem_src.crs, always_xy=True)
+        xs, ys = to_dem.transform(lons, lats)
+        coords = list(zip(xs, ys))
+
+        samples = list(dem_src.sample(coords, indexes=1, masked=True))
+        nodata = dem_src.nodata
+
+    out: List[Dict] = []
+    dropped = 0
+    for tp, s in zip(tie_points, samples):
+        val = s[0]
+        if np.ma.is_masked(val):
+            dropped += 1
+            continue
+
+        h = float(val)
+        if not np.isfinite(h):
+            dropped += 1
+            continue
+        if nodata is not None and h == float(nodata):
+            dropped += 1
+            continue
+
+        tpe = dict(tp)
+        tpe["height_m"] = h
+        out.append(tpe)
+
+    logger.info(
+        "DEM enrichment: kept %d / %d tie points (dropped %d without valid DEM height)",
+        len(out), len(tie_points), dropped,
+    )
+    return out
+
+
 # ── Residual function ──────────────────────────────────────────────────
 
 def _residuals(params: np.ndarray,
                model: RobustModel,
                tie_points: List[Dict]) -> np.ndarray:
     """
-    Compute [lon_err_m, lat_err_m] for every tie point.
-    Returns flat array of length 2·N.
+    Compute 3D ECEF residuals [dx_m, dy_m, dz_m] for each tie point.
+    Returns flat array of length 3·N.
     """
     residuals: List[float] = []
     for tp in tie_points:
         pred_ecef = model.predict_with_params(
-            tp["phisat_x"], tp["phisat_y"], params)
+            tp["phisat_x"], tp["phisat_y"], params,
+            ground_height=tp["height_m"],
+        )
 
         if pred_ecef is None:
-            residuals.extend([1e5, 1e5])
+            residuals.extend([1e5, 1e5, 1e5])
             continue
 
-        pred_lon, pred_lat, _ = model.ecef_to_lonlat(*pred_ecef)
-
-        lat_res_m = (pred_lat - tp["lat"]) * METRES_PER_DEGREE_LAT
-        lon_scale = METRES_PER_DEGREE_LAT * np.cos(np.radians(tp["lat"]))
-        lon_res_m = (pred_lon - tp["lon"]) * lon_scale
-
-        residuals.append(lon_res_m)
-        residuals.append(lat_res_m)
+        target_ecef = model.lonlat_to_ecef(tp["lon"], tp["lat"], tp["height_m"])
+        diff = pred_ecef - target_ecef
+        residuals.append(float(diff[0]))
+        residuals.append(float(diff[1]))
+        residuals.append(float(diff[2]))
 
     return np.array(residuals)
 
@@ -108,6 +160,10 @@ def run_calibration(config: SceneConfig,
     # Tie points
     all_points = load_tie_points(str(config.tie_points_path))
     logger.info("Loaded %d tie points.", len(all_points))
+    all_points = _attach_dem_heights(config, all_points)
+    if len(all_points) < 20:
+        raise RuntimeError(
+            f"Not enough DEM-enriched tie points for calibration: {len(all_points)}")
 
     # Bounds
     x0 = list(PARAM_INITIAL)
@@ -125,7 +181,7 @@ def run_calibration(config: SceneConfig,
 
     # ── Phase 2: 3-σ outlier removal ──
     logger.info("\n--- Phase 2: Outlier Filtering (%d-σ) ---", OUTLIER_SIGMA)
-    res_vec = _residuals(res1.x, model, all_points).reshape(-1, 2)
+    res_vec = _residuals(res1.x, model, all_points).reshape(-1, 3)
     distances = np.linalg.norm(res_vec, axis=1)
 
     mean_err = np.mean(distances)
