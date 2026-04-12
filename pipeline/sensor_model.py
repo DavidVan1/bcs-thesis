@@ -7,10 +7,11 @@ Inverse model:  (lon, lat) → pixel (px, py)  (via Newton-Raphson)
 
 Supports:
 - Pushbroom geometry (time-dependent position per scanline)
-- Ray–sphere intersection with spherical Earth
+- Ray–ellipsoid intersection with WGS84 Earth
 - LVLH orbital frame
 - Mounting bias (roll, pitch, yaw)
 - Radial distortion (k1, k2)
+- Optional atmospheric refraction correction (Noerdlinger-style)
 """
 
 import json
@@ -19,6 +20,7 @@ import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple
 
+from pyproj import Transformer
 from scipy.spatial.transform import Rotation as SciRot
 
 logger = logging.getLogger(__name__)
@@ -28,7 +30,10 @@ logger = logging.getLogger(__name__)
 # Base pushbroom model
 # ═══════════════════════════════════════════════════════════════════════════
 
-R_EARTH = 6_371_000.0  # metres (spherical approximation)
+WGS84_A = 6_378_137.0                # semi-major axis [m]
+WGS84_B = 6_356_752.314245           # semi-minor axis [m]
+ATMOS_REFRACTION_BETA = 2.0e-5       # rad-scale (Noerdlinger-style approximation)
+ATMOS_SCALE_HEIGHT_M = 8_000.0       # exponential density scale height [m]
 
 
 class PhiSatPushbroomModel:
@@ -62,6 +67,9 @@ class PhiSatPushbroomModel:
         self.line_time = 0.001        # seconds per scanline
         self.along_scale = 1.0
         self.along_shift = 0.0
+
+    _GEODETIC_TO_ECEF = Transformer.from_crs("EPSG:4979", "EPSG:4978", always_xy=True)
+    _ECEF_TO_GEODETIC = Transformer.from_crs("EPSG:4978", "EPSG:4979", always_xy=True)
 
     # ── Metadata loading ────────────────────────────────────────────
 
@@ -160,33 +168,37 @@ class PhiSatPushbroomModel:
         R_o2e = self.get_orbital_rotation_matrix(sat_pos, self.velocity)
 
         ray_world = R_o2e @ R_b2o @ ray_cam
+        ray_world = _apply_atmospheric_refraction(
+            ray_world=ray_world,
+            sat_pos=sat_pos,
+            ground_height=float(ground_height),
+        )
 
-        return _intersect_sphere(sat_pos, ray_world,
-                                 R_EARTH + ground_height)
+        return _intersect_ellipsoid(
+            origin=sat_pos,
+            direction=ray_world,
+            ground_height=float(ground_height),
+        )
 
     # ── ECEF ↔ geodetic ────────────────────────────────────────────
 
     @staticmethod
     def ecef_to_lonlat(x: float, y: float,
                        z: float) -> Tuple[float, float, float]:
-        """ECEF → (lon, lat, height) using spherical approximation."""
-        r = np.sqrt(x*x + y*y + z*z)
-        lat = np.degrees(np.arcsin(z / r))
-        lon = np.degrees(np.arctan2(y, x))
-        return lon, lat, r - R_EARTH
+        """ECEF → (lon, lat, height) using WGS84 ellipsoid."""
+        lon, lat, h = PhiSatPushbroomModel._ECEF_TO_GEODETIC.transform(
+            float(x), float(y), float(z)
+        )
+        return float(lon), float(lat), float(h)
 
     @staticmethod
     def lonlat_to_ecef(lon: float, lat: float,
                        height: float = 0.0) -> np.ndarray:
-        """(lon, lat, height) → ECEF using spherical approximation."""
-        lon_r = np.radians(lon)
-        lat_r = np.radians(lat)
-        r = R_EARTH + float(height)
-        clat = np.cos(lat_r)
-        x = r * clat * np.cos(lon_r)
-        y = r * clat * np.sin(lon_r)
-        z = r * np.sin(lat_r)
-        return np.array([x, y, z], dtype=np.float64)
+        """(lon, lat, height) → ECEF using WGS84 ellipsoid."""
+        x, y, z = PhiSatPushbroomModel._GEODETIC_TO_ECEF.transform(
+            float(lon), float(lat), float(height)
+        )
+        return np.array([float(x), float(y), float(z)], dtype=np.float64)
 
     # ── Convenience ─────────────────────────────────────────────────
 
@@ -285,19 +297,39 @@ class RobustModel(PhiSatPushbroomModel):
         R_o2e = self.get_orbital_rotation_matrix(sat_pos, self.velocity)
 
         ray_world = R_o2e @ R_b2o @ ray_body
-        return _intersect_sphere(sat_pos, ray_world, R_EARTH + float(ground_height))
+        ray_world = _apply_atmospheric_refraction(
+            ray_world=ray_world,
+            sat_pos=sat_pos,
+            ground_height=float(ground_height),
+        )
+        return _intersect_ellipsoid(
+            origin=sat_pos,
+            direction=ray_world,
+            ground_height=float(ground_height),
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Private helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _intersect_sphere(origin: np.ndarray, direction: np.ndarray,
-                      radius: float) -> Optional[np.ndarray]:
-    """Ray–sphere intersection.  Returns ECEF point or None."""
-    a = np.dot(direction, direction)
-    b = 2.0 * np.dot(origin, direction)
-    c = np.dot(origin, origin) - radius * radius
+def _intersect_ellipsoid(origin: np.ndarray,
+                         direction: np.ndarray,
+                         ground_height: float = 0.0) -> Optional[np.ndarray]:
+    """Ray–WGS84-ellipsoid intersection at constant ellipsoidal height."""
+    a_axis = WGS84_A + float(ground_height)
+    b_axis = WGS84_B + float(ground_height)
+
+    ox, oy, oz = float(origin[0]), float(origin[1]), float(origin[2])
+    dx, dy, dz = float(direction[0]), float(direction[1]), float(direction[2])
+
+    inv_a2 = 1.0 / (a_axis * a_axis)
+    inv_b2 = 1.0 / (b_axis * b_axis)
+
+    a = (dx * dx + dy * dy) * inv_a2 + (dz * dz) * inv_b2
+    b = 2.0 * ((ox * dx + oy * dy) * inv_a2 + (oz * dz) * inv_b2)
+    c = (ox * ox + oy * oy) * inv_a2 + (oz * oz) * inv_b2 - 1.0
+
     disc = b * b - 4.0 * a * c
     if disc < 0:
         return None
@@ -308,6 +340,52 @@ def _intersect_sphere(origin: np.ndarray, direction: np.ndarray,
     if u <= 0:
         return None
     return origin + u * direction
+
+
+def _apply_atmospheric_refraction(ray_world: np.ndarray,
+                                  sat_pos: np.ndarray,
+                                  ground_height: float = 0.0) -> np.ndarray:
+    """Apply a small Noerdlinger-style refraction bend towards nadir.
+
+    This keeps a lightweight physically-motivated correction without a full
+    ray-tracing atmosphere model. The bend magnitude scales with off-nadir
+    angle and exponentially with target height.
+    """
+    ray = np.asarray(ray_world, dtype=np.float64)
+    ray_norm = np.linalg.norm(ray)
+    if ray_norm <= 0.0:
+        return ray_world
+    ray /= ray_norm
+
+    sat = np.asarray(sat_pos, dtype=np.float64)
+    sat_norm = np.linalg.norm(sat)
+    if sat_norm <= 0.0:
+        return ray_world
+
+    nadir = -sat / sat_norm
+    cos_off = float(np.clip(np.dot(ray, nadir), -1.0, 1.0))
+    off_nadir = float(np.arccos(cos_off))
+    if off_nadir < 1e-8:
+        return ray_world
+
+    # Noerdlinger-style lightweight approximation: bend towards nadir.
+    # Stronger at larger off-nadir, weaker at higher terrain elevation.
+    height_factor = float(np.exp(-max(0.0, ground_height) / ATMOS_SCALE_HEIGHT_M))
+    bend = ATMOS_REFRACTION_BETA * np.tan(off_nadir) * height_factor
+    bend = float(np.clip(bend, 0.0, off_nadir * 0.9))
+    if bend <= 0.0:
+        return ray_world
+
+    transverse = ray - cos_off * nadir
+    t_norm = np.linalg.norm(transverse)
+    if t_norm <= 1e-12:
+        return ray_world
+    t_hat = transverse / t_norm
+
+    off_corr = off_nadir - bend
+    ray_corr = np.cos(off_corr) * nadir + np.sin(off_corr) * t_hat
+    ray_corr /= np.linalg.norm(ray_corr)
+    return ray_corr
 
 
 # ═══════════════════════════════════════════════════════════════════════════
