@@ -191,6 +191,7 @@ class SceneConfig:
 
         if stage in ("all", "calibration"):
             _check(self.tie_points_path, "Tie points CSV")
+            _check(self.dem_path, "DEM")
 
         if stage in ("all", "orthorectify"):
             _check(self.dem_path, "DEM")
