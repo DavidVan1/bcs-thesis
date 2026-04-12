@@ -388,7 +388,7 @@ def run_matching(config: SceneConfig,
     sen_h, sen_w = sen_enh.shape[:2]
     
     # We stride across the Sentinel image in chunks roughly the size of the PhiSat image.
-    # This guarantees the neural network sees exactly the same scale!
+    # This guarantees the neural network sees exactly the same scale
     step_y = max(1, int(phi_h * 0.75))
     step_x = max(1, int(phi_w * 0.75))
     
@@ -437,7 +437,7 @@ def run_matching(config: SceneConfig,
     kp0, kp1, conf = ransac_filter(kp0, kp1, conf)
     logger.info("After RANSAC: %d", len(kp0))
 
-    max_saved_matches = 10000
+    max_saved_matches = 5000
     if len(kp0) > max_saved_matches:
         best_idx = np.argsort(conf)[-max_saved_matches:]
         best_idx = best_idx[np.argsort(conf[best_idx])[::-1]]
