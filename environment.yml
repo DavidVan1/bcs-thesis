@@ -1,4 +1,4 @@
-name: phisat
+name: philab
 
 channels:
   - pytorch
@@ -12,7 +12,7 @@ dependencies:
   # PyTorch with CUDA 12.1 (change cu121 → cu118 if your server has CUDA 11.8)
   - pytorch::pytorch>=2.0
   - pytorch::torchvision>=0.15
-  - pytorch::pytorch-cuda=12.1
+  - pytorch::pytorch-cuda=12.4
 
   # Geospatial stack (conda builds link against system GDAL/PROJ correctly)
   - conda-forge::rasterio>=1.3
@@ -43,12 +43,13 @@ dependencies:
     # Data fetching (Google Earth Engine + Copernicus)
     - earthengine-api
     - geedim
+    - click
     # Third-party matcher dependencies
     - -r third_party/LightGlue/requirements.txt
-    - -r third_party/RoMa/requirements.txt
-    - -r third_party/XoFTR/requirements.txt
-    - -r third_party/dust3r/requirements.txt
-    - -r third_party/mast3r/requirements.txt
+    # - -r third_party/RoMa/requirements.txt
+    # - -r third_party/XoFTR/requirements.txt
+    # - -r third_party/dust3r/requirements.txt
+    # - -r third_party/mast3r/requirements.txt
 
 # Create:  conda env create -f environment.yml
 # Update:  conda env update -f environment.yml --prune
