@@ -1,4 +1,4 @@
-name: phisat
+name: phis
 
 channels:
   - pytorch
@@ -7,50 +7,36 @@ channels:
   - defaults
 
 dependencies:
-  - python=3.11
+  - python=3.10
+  - pip
 
-  # PyTorch with CUDA 12.1 (change cu121 → cu118 if your server has CUDA 11.8)
   - pytorch::pytorch>=2.0
   - pytorch::torchvision>=0.15
   - pytorch::pytorch-cuda=12.1
 
-  # Geospatial stack (conda builds link against system GDAL/PROJ correctly)
   - conda-forge::rasterio>=1.3
   - conda-forge::pyproj>=3.5
   - conda-forge::shapely>=2.0
   - conda-forge::libgdal-jp2openjpeg
 
-  # ML/HuggingFace
-  - conda-forge::huggingface_hub
-
-  # Scientific
   - conda-forge::numpy>=1.24
   - conda-forge::scipy>=1.10
+  - conda-forge::pandas
+  - conda-forge::matplotlib>=3.7
+  - conda-forge::tqdm>=4.65
+  - conda-forge::scikit-learn>=1.3
+  - conda-forge::psutil
+  - conda-forge::opencv
+  - conda-forge::huggingface_hub
 
-  # pip-only packages
-  - pip
   - pip:
+    - "setuptools<82.0.0"      
     - kornia>=0.7
-    - opencv-python>=4.7
     - Pillow>=10.0
-    - matplotlib>=3.7
-    - tqdm>=4.65
-    - scikit-learn>=1.3
     - affine>=2.4
     - yacs
-    - psutil>=5.9
     - pycolmap
-    # Data fetching (Google Earth Engine + Copernicus)
     - earthengine-api
     - geedim
-    # Third-party matcher dependencies
     - -r third_party/LightGlue/requirements.txt
-    - -r third_party/RoMa/requirements.txt
-    - -r third_party/XoFTR/requirements.txt
-    - -r third_party/dust3r/requirements.txt
-    - -r third_party/mast3r/requirements.txt
-
-# Create:  conda env create -f environment.yml
-# Update:  conda env update -f environment.yml --prune
-# Activate: conda activate phisat
-# Run:     python -m pipeline.run sf
+    - -r third_party/EfficientLoFTR/requirements.txt
