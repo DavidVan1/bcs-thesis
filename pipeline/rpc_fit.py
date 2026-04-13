@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import rasterio
 
-from pipeline.config import get_scene_config
 from pipeline.sensor_model import RobustModel, create_model
 from pipeline.utils import load_calibration
 
@@ -53,11 +53,10 @@ def _fit_rational_rpc_component(target_n: np.ndarray, terms: np.ndarray) -> tupl
     den[1:] = coeff[20:]
     return num, den
 
-def _get_dem_height_range(cfg) -> tuple[float, float]:
+def _get_dem_height_range(dem_path: Path) -> tuple[float, float]:
     """Return (h_min, h_max) from DEM valid pixels for the whole scene."""
     fallback = (-500.0, 5000.0)
 
-    dem_path = cfg.dem_path
     if dem_path is None or not dem_path.exists():
         return fallback
 
@@ -86,22 +85,34 @@ def _get_dem_height_range(cfg) -> tuple[float, float]:
 
 
 def fit_rpc(
-    scene: str,
-    matcher: str,
+    phisat_tiff: Path,
+    calibration_path: Path,
+    dem_path: Path,
+    output_path: Path,
+    aocs_path: Path,
+    metadata_path: Optional[Path] = None,
     grid_size: int = 64,
-    output_path: str | None = None,
+    f: float = 105790.0,
+    cx: float = 2048.0,
+    cy: float = 2048.0,
 ) -> Path:
     """Fit RPC coefficients from calibrated rigorous model and DEM height span."""
-    cfg = get_scene_config(scene)
-    cfg.set_matcher(matcher)
+    if not phisat_tiff.exists():
+        raise FileNotFoundError(f"PhiSat image not found: {phisat_tiff}")
+    if not calibration_path.exists():
+        raise FileNotFoundError(f"Calibration not found: {calibration_path}")
+    if not aocs_path.exists():
+        raise FileNotFoundError(f"AOCS not found: {aocs_path}")
 
-    if cfg.calib_path is None or not cfg.calib_path.exists():
-        raise FileNotFoundError(
-            f"Calibration not found: {cfg.calib_path}. Run matching+calibration first."
-        )
-
-    model = create_model(cfg, model_class=RobustModel)
-    calib = load_calibration(str(cfg.calib_path))
+    model = create_model(
+        aocs_path,
+        metadata_path,
+        f=f,
+        cx=cx,
+        cy=cy,
+        model_class=RobustModel,
+    )
+    calib = load_calibration(str(calibration_path))
 
     params = np.array([
         float(calib.get("time_shift", 0.0)),
@@ -119,7 +130,7 @@ def fit_rpc(
     ], dtype=np.float64)
 
 
-    with rasterio.open(str(cfg.phisat_image_path)) as src:
+    with rasterio.open(str(phisat_tiff)) as src:
         image_w = int(src.width)
         image_h = int(src.height)
 
@@ -128,7 +139,7 @@ def fit_rpc(
     ys = np.linspace(0.0, image_h - 1.0, grid_size, dtype=np.float64)
 
     # 3D grid in DEM-derived global height range for this scene.
-    h_min, h_max = _get_dem_height_range(cfg)
+    h_min, h_max = _get_dem_height_range(dem_path)
     height_levels = np.linspace(h_min, h_max, 5, dtype=np.float64)
     print(f"Using DEM height range: [{h_min:.3f}, {h_max:.3f}] m")
     print(f"Height levels: {height_levels}")
@@ -226,12 +237,7 @@ def fit_rpc(
     }
 
 
-    if output_path is None:
-        out_path = cfg.output_dir / f"rpc_{matcher}.json"
-    else:
-        out_path = Path(output_path)
-
-
+    out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(rpc, indent=2))
 

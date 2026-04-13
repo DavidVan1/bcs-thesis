@@ -30,7 +30,7 @@ try:
 except ImportError:
     HAS_CV2 = False
 
-from .config import SceneConfig, PHISAT_GSD_M
+from .config import PHISAT_GSD_M
 
 # PhiSat-2 GSD (metres) — re-exported for local use
 PIXEL_SIZE: float = PHISAT_GSD_M
@@ -169,7 +169,9 @@ def _check_holdout(gcps: List[dict],
     return holdout, excluded
 
 
-def _select_gcps(config: SceneConfig,
+def _select_gcps(gcp_json_path: Path,
+                 gcp_chip_dir: Path,
+                 tie_points_path: Optional[Path],
                  ortho_bounds, ortho_data, ortho_crs, ortho_tf,
                  require_chip: bool = True,
                  ) -> Tuple[List[dict], dict]:
@@ -178,12 +180,12 @@ def _select_gcps(config: SceneConfig,
 
     Returns (selected_gcps, meta_dict).
     """
-    gcp_dir = config.gcp_json_path.parent
+    gcp_dir = gcp_json_path.parent
     n_json = len(list(gcp_dir.glob("*.json")))
 
-    all_gcps = _load_all_gcps(config.gcp_json_path, config.gcp_chip_dir_path)
+    all_gcps = _load_all_gcps(gcp_json_path, gcp_chip_dir)
 
-    holdout, n_excl = _check_holdout(all_gcps, config.tie_points_path)
+    holdout, n_excl = _check_holdout(all_gcps, tie_points_path)
 
     in_ortho = _filter_to_ortho(holdout, ortho_bounds, ortho_data,
                                 ortho_crs,
@@ -638,9 +640,15 @@ def _single_pass_ncc(
     return dy, dx, ncc, edge_hit, False, chip_up
 
 
-def verify_ncc(config: SceneConfig,
-               min_ncc: float = 0.25,
-               reference_source: str = "sentinel") -> dict:
+def verify_ncc(
+    ortho_path: Path,
+    gcp_json_path: Path,
+    gcp_chip_dir: Path,
+    output_path: Path,
+    tie_points_path: Optional[Path] = None,
+    min_ncc: float = 0.25,
+    reference_source: str = "sentinel",
+) -> dict:
     """
     Two-pass NCC verification with consistency gate.
 
@@ -658,20 +666,19 @@ def verify_ncc(config: SceneConfig,
     MAD outlier rejection runs **after** the consistency gate as a
     final reporting filter to remove genuinely bad GCP chips.
     """
-    ortho_path = str(config.ortho_path)
-
     logger.info("\n" + "=" * 72)
-    logger.info(f"METHOD B — Two-pass NCC ({reference_source}) — scene '{config.name}'")
+    logger.info(f"METHOD B — Two-pass NCC ({reference_source})")
     logger.info("=" * 72)
 
-    with rasterio.open(ortho_path) as src:
+    with rasterio.open(str(ortho_path)) as src:
         ob = src.bounds
         ortho_data = src.read()
         ortho_crs = src.crs
         ortho_tf   = src.transform
 
     require_chip = (reference_source == "sentinel")
-    gcps, meta = _select_gcps(config, ob, ortho_data, ortho_crs, ortho_tf,
+    gcps, meta = _select_gcps(gcp_json_path, gcp_chip_dir, tie_points_path,
+                              ob, ortho_data, ortho_crs, ortho_tf,
                               require_chip=require_chip)
 
     if reference_source != "sentinel":
@@ -705,7 +712,7 @@ def verify_ncc(config: SceneConfig,
 
         # ── Pass 1: coarse (wide search) ─────────────────────────────
         dy1, dx1, ncc1, edge1, no_data1, chip_up = _single_pass_ncc(
-            ortho_path, chip_data, chip_crs, chip_bounds,
+            str(ortho_path), chip_data, chip_crs, chip_bounds,
             chip_res, chip_shape, work_res,
             margin_m=_COARSE_MARGIN_M,
         )
@@ -740,7 +747,7 @@ def verify_ncc(config: SceneConfig,
 
         # ── Pass 2: fine (tight search centred on coarse hit) ────────
         dy2, dx2, ncc2, edge2, no_data2, _ = _single_pass_ncc(
-            ortho_path, chip_data, chip_crs, chip_bounds,
+            str(ortho_path), chip_data, chip_crs, chip_bounds,
             chip_res, chip_shape, work_res,
             margin_m=_FINE_MARGIN_M,
             offset_e=coarse_e,
@@ -825,8 +832,7 @@ def verify_ncc(config: SceneConfig,
     stats = _compute_stats(results)
     _print_stats(stats, meta, f"Two-pass NCC ({reference_source})")
 
-    out = config.output_dir / "verify_ncc.json"
-    _save_json(out, results, stats, meta, "ncc_two_pass")
+    _save_json(output_path, results, stats, meta, "ncc_two_pass")
 
     return dict(results=results, stats=stats, meta=meta)
 
@@ -838,17 +844,22 @@ def verify_ncc(config: SceneConfig,
 VERIFY_METHODS = ["all", "ncc"]
 
 
-def run_verification(config: SceneConfig,
-                     method: str = "ncc",
-                     min_ncc: float = 0.25,
-                     reference_source: str = "sentinel",
-                     ) -> dict:
+def run_verify(
+    ortho_path: Path,
+    gcp_json_path: Path,
+    gcp_chip_dir: Path,
+    output_path: Path,
+    tie_points_path: Optional[Path] = None,
+    method: str = "ncc",
+    min_ncc: float = 0.25,
+    reference_source: str = "sentinel",
+) -> dict:
     """
     Run GCP verification for a scene.
 
     Parameters
     ----------
-    config : SceneConfig
+    ortho_path : Path
     method : str
         ``"ncc"`` runs NCC verification. ``"all"`` is accepted as
         a backward-compatible alias for ``"ncc"``.
@@ -858,7 +869,13 @@ def run_verification(config: SceneConfig,
     if reference_source != "sentinel":
         raise ValueError("reference_source must be 'sentinel'")
 
-    missing = config.check_inputs("verify")
+    missing = []
+    if not ortho_path.exists():
+        missing.append(f"Ortho GeoTIFF: {ortho_path}")
+    if not gcp_json_path.exists():
+        missing.append(f"GCP JSON: {gcp_json_path}")
+    if not gcp_chip_dir.exists():
+        missing.append(f"GCP chip dir: {gcp_chip_dir}")
 
     if missing:
         raise FileNotFoundError(
@@ -879,12 +896,18 @@ def run_verification(config: SceneConfig,
     out: dict = {}
 
     if method in ("all", "ncc"):
-        out["ncc"] = verify_ncc(config, min_ncc=min_ncc,
+        out["ncc"] = verify_ncc(
+                                ortho_path,
+                                gcp_json_path,
+                                gcp_chip_dir,
+                                output_path,
+                                tie_points_path=tie_points_path,
+                                min_ncc=min_ncc,
                                 reference_source=reference_source)
 
     # Also save NCC results under the legacy path
     if method == "all" and "ncc" in out:
-        legacy = config.verification_json_path
+        legacy = output_path
         ncc_res = out["ncc"]
         _save_json(legacy,
                    ncc_res.get("results", []),
@@ -893,3 +916,8 @@ def run_verification(config: SceneConfig,
                    "ncc (legacy verification_results.json)")
 
     return out
+
+
+def run_verification(*args, **kwargs) -> dict:
+    """Backward-compatible alias for ``run_verify``."""
+    return run_verify(*args, **kwargs)

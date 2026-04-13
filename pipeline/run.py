@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Optional, Sequence
 
-from .config import get_scene_config, list_scenes, SceneConfig
+from .config import get_scene_config, list_scenes, SceneConfig, PROJECT_ROOT
 from .profiler import PipelineProfile, profile_stage, _gpu_available
 
 logger = logging.getLogger(__name__)
@@ -92,7 +92,7 @@ def register_stage(name: str) -> Callable[[StageRunner], StageRunner]:
 def _run_fetch(ctx: StageContext) -> None:
     """Download Sentinel-2, DEM and GCPs from Google Earth Engine / Copernicus."""
     from .fetch import run_fetch
-    run_fetch(ctx.config,
+    run_fetch(ctx.config.phisat_dir_path,
               no_gcp_chips=ctx.no_gcp_chips)
 
 
@@ -100,14 +100,35 @@ def _run_fetch(ctx: StageContext) -> None:
 def _run_match(ctx: StageContext) -> None:
     """Run the feature matching stage."""
     from .matching import run_matching
-    run_matching(ctx.config, matcher_name=ctx.matcher_name)
+    sentinel_tiff = ctx.config.phisat_dir_path / "sentinel.tif"
+    if not sentinel_tiff.exists():
+        raise FileNotFoundError(f"Missing sentinel.tif in {ctx.config.phisat_dir_path}")
+    run_matching(
+        ctx.config.phisat_image_path,
+        sentinel_tiff,
+        ctx.config.output_dir,
+        ctx.config.tie_points_path,
+        matcher_name=ctx.matcher_name,
+        margin_pixels=ctx.config.margin_pixels,
+        max_keypoints=ctx.config.max_keypoints,
+    )
 
 
 @register_stage("calibrate")
 def _run_calibrate(ctx: StageContext) -> None:
     """Run the sensor calibration stage."""
     from .calibration import run_calibration
-    run_calibration(ctx.config, verbose=True)
+    run_calibration(
+        ctx.config.aocs_path,
+        ctx.config.metadata_path,
+        ctx.config.tie_points_path,
+        ctx.config.dem_path,
+        ctx.config.calib_path,
+        f=ctx.config.initial_f,
+        cx=ctx.config.cx,
+        cy=ctx.config.cy,
+        verbose=True,
+    )
 
 
 @register_stage("rpc_fit")
@@ -115,31 +136,46 @@ def _run_rpc_fit(ctx: StageContext) -> None:
     """Fit RPC model from calibrated rigorous geometry."""
     from .rpc_fit import fit_rpc
     fit_rpc(
-        scene=ctx.config.name,
-        matcher=ctx.matcher_name,
+        phisat_tiff=ctx.config.phisat_image_path,
+        calibration_path=ctx.config.calib_path,
+        dem_path=ctx.config.dem_path,
+        output_path=Path(ctx.rpc_output),
+        aocs_path=ctx.config.aocs_path,
+        metadata_path=ctx.config.metadata_path,
         grid_size=ctx.rpc_grid_size,
-        output_path=ctx.rpc_output,
+        f=ctx.config.initial_f,
+        cx=ctx.config.cx,
+        cy=ctx.config.cy,
     )
 
 
 @register_stage("orthorectify")
 def _run_orthorectify(ctx: StageContext) -> None:
     """Run the orthorectification stage."""
-    from .orthorectify import run_orthorectify_rpc
+    from .orthorectify import run_orthorectify
     if not ctx.rpc_json:
         raise ValueError("orthorectify requires an RPC JSON path")
-    run_orthorectify_rpc(
-        ctx.config,
-        rpc_json_path=ctx.rpc_json,
+    run_orthorectify(
+        ctx.config.phisat_image_path,
+        ctx.config.dem_path,
+        Path(ctx.rpc_json),
+        ctx.config.ortho_path,
     )
 
 
 @register_stage("verify")
 def _run_verify(ctx: StageContext) -> None:
     """Run NCC-based GCP verification."""
-    from .verify import run_verification
-    run_verification(ctx.config, method=ctx.verify_method,
-                     reference_source=ctx.reference_source)
+    from .verify import run_verify
+    run_verify(
+        ctx.config.ortho_path,
+        ctx.config.gcp_json_path,
+        ctx.config.gcp_chip_dir_path,
+        ctx.config.verification_json_path,
+        tie_points_path=ctx.config.tie_points_path,
+        method=ctx.verify_method,
+        reference_source=ctx.reference_source,
+    )
 
 
 # ── Pipeline orchestrator ──────────────────────────────────────────────
@@ -214,12 +250,15 @@ def _build_config(args: argparse.Namespace) -> SceneConfig:
     # Scene not in scenes.json — allow fetch to bootstrap it
     if args.stage == "fetch" and args.phisat_dir:
         from .fetch import _find_phisat_image
+        chosen_image, metadata_json = _find_phisat_image(PROJECT_ROOT / args.phisat_dir)
+        if chosen_image is None:
+            raise FileNotFoundError(f"No PhiSat TIFF found in {(PROJECT_ROOT / args.phisat_dir) / 'bands'}")
         config = SceneConfig(
             name=args.scene,
             phisat_dir=args.phisat_dir,
-            phisat_image="bands/Bp_0_0_4096_4096_0_0_4096_4096_12_RGB.tiff",
+            phisat_image=str(chosen_image.relative_to(PROJECT_ROOT / args.phisat_dir)),
+            metadata_json=metadata_json.name if metadata_json else None,
         )
-        _find_phisat_image(config)
         return config
 
     logger.error(

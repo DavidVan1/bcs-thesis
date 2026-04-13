@@ -20,7 +20,6 @@ from rasterio.warp import reproject, Resampling, transform_bounds
 from pyproj import Transformer, CRS
 import torch
 
-from .config import SceneConfig
 from .matchers import get_matcher, list_matchers
 from .utils import (
     enhance_for_matching,
@@ -306,8 +305,15 @@ def visualize_matches(image0: np.ndarray, image1: np.ndarray,
 
 # ── Full matching pipeline ─────────────────────────────────────────────
 
-def run_matching(config: SceneConfig,
-                 matcher_name: str = "lightglue") -> List[Dict]:
+def run_matching(
+    phisat_tiff: Path,
+    sentinel_tiff: Path,
+    output_dir: Path,
+    tie_points_path: Path,
+    matcher_name: str = "lightglue",
+    margin_pixels: int = 512,
+    max_keypoints: int = 2048,
+) -> List[Dict]:
     """
     Run the full matching pipeline for a scene:
       1. Load PhiSat + Sentinel
@@ -320,37 +326,37 @@ def run_matching(config: SceneConfig,
 
     Parameters
     ----------
-    config : SceneConfig
+    phisat_tiff : Path
+    sentinel_tiff : Path
+    output_dir : Path
+    tie_points_path : Path
     matcher_name : str
         One of: lightglue, xoftr, loftr, roma, mast3r, dust3r.
 
     Returns list of tie-point dicts.
     """
-    missing = config.check_inputs("matching")
+    missing = []
+    if not phisat_tiff.exists():
+        missing.append(f"PhiSat image: {phisat_tiff}")
+    if not sentinel_tiff.exists():
+        missing.append(f"Sentinel image: {sentinel_tiff}")
     if missing:
         raise FileNotFoundError(
             "Missing files for matching:\n  " + "\n  ".join(missing))
 
     logger.info("=" * 60)
-    logger.info("MATCHING — scene '%s'  matcher=%s", config.name, matcher_name)
+    logger.info("MATCHING — matcher=%s", matcher_name)
     logger.info("=" * 60)
 
-    config.ensure_output_dir()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Load images
-    phisat_img, phisat_ds = load_satellite_image(str(config.phisat_image_path))
-
-    sentinel_path = find_sentinel_band(str(config.sentinel_dir_path),
-                                       config.sentinel_band)
-    if not sentinel_path:
-        raise FileNotFoundError(
-            f"Sentinel band '{config.sentinel_band}' not found "
-            f"in {config.sentinel_dir_path}")
-    sentinel_img, sentinel_ds = load_satellite_image(sentinel_path)
+    phisat_img, phisat_ds = load_satellite_image(str(phisat_tiff))
+    sentinel_img, sentinel_ds = load_satellite_image(str(sentinel_tiff))
 
     # Save native (non-reprojected) PhiSat debug image for geometry sanity checks
     cv2.imwrite(
-        str(config.output_dir / "debug_phisat_native.jpg"),
+        str(output_dir / "debug_phisat_native.jpg"),
         cv2.cvtColor(phisat_img, cv2.COLOR_RGB2BGR),
     )
 
@@ -358,13 +364,13 @@ def run_matching(config: SceneConfig,
     phisat_aligned, sentinel_aligned, phi_tf, sen_tf, common_crs, phisat_effective_transform = create_independent_scaled_grids(
         phisat_img, phisat_ds,
         sentinel_img, sentinel_ds,
-        margin_pixels=config.margin_pixels
+        margin_pixels=margin_pixels
     )
 
     # Save raw reprojected debug images
-    cv2.imwrite(str(config.debug_phisat_path),
+    cv2.imwrite(str(output_dir / "debug_phisat.jpg"),
                 cv2.cvtColor(phisat_aligned, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(str(config.debug_sentinel_path),
+    cv2.imwrite(str(output_dir / "debug_sentinel.jpg"),
                 cv2.cvtColor(sentinel_aligned, cv2.COLOR_RGB2BGR))
 
     # 3. Enhance for matching
@@ -373,16 +379,16 @@ def run_matching(config: SceneConfig,
     sen_enh = enhance_for_matching(sentinel_aligned)
 
     # Save enhanced debug variants
-    cv2.imwrite(str(config.output_dir / "debug_phisat_enh.jpg"),
+    cv2.imwrite(str(output_dir / "debug_phisat_enh.jpg"),
                 cv2.cvtColor(phi_enh, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(str(config.output_dir / "debug_sentinel_enh.jpg"),
+    cv2.imwrite(str(output_dir / "debug_sentinel_enh.jpg"),
                 cv2.cvtColor(sen_enh, cv2.COLOR_RGB2BGR))
-    logger.info("  Debug images → %s", config.output_dir)
+    logger.info("  Debug images → %s", output_dir)
 
     # 4. Match (using a sliding window over the massive Sentinel image)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     matcher = get_matcher(matcher_name, device=device,
-                          max_keypoints=config.max_keypoints)
+                          max_keypoints=max_keypoints)
     
     phi_h, phi_w = phi_enh.shape[:2]
     sen_h, sen_w = sen_enh.shape[:2]
@@ -453,7 +459,7 @@ def run_matching(config: SceneConfig,
         return []
 
     # 6. Visualise matches  (include matcher name in filename)
-    viz_path = config.output_dir / f"matches_{matcher_name}.png"
+    viz_path = output_dir / f"matches_{matcher_name}.png"
     visualize_matches(phi_enh, sen_enh, kp0, kp1, str(viz_path))
 
     # 7. Geo-coordinates
@@ -480,9 +486,8 @@ def run_matching(config: SceneConfig,
         })
 
     # 8. Save
-    if config.tie_points_csv:
-        save_tie_points(tie_points, str(config.tie_points_path))
-        logger.info("Saved %d tie points → %s", len(tie_points), config.tie_points_path)
+    save_tie_points(tie_points, str(tie_points_path))
+    logger.info("Saved %d tie points → %s", len(tie_points), tie_points_path)
 
     phisat_ds.close()
     sentinel_ds.close()

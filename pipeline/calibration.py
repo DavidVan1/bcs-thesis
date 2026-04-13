@@ -12,14 +12,14 @@ Parameter vector (12):
 
 import json
 import logging
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import numpy as np
 import rasterio
 from pyproj import Transformer
 from scipy.optimize import least_squares
 
-from .config import SceneConfig
 from .sensor_model import RobustModel, create_model
 from .utils import load_tie_points, save_calibration
 
@@ -52,10 +52,9 @@ OUTLIER_SIGMA: float = 3.0
 DRIFT_WARNING_THRESHOLD: float = 1  # degrees
 
 
-def _attach_dem_heights(config: SceneConfig,
+def _attach_dem_heights(dem_path: Path,
                         tie_points: List[Dict]) -> List[Dict]:
     """Attach DEM elevation (metres) to each tie point as `height_m`."""
-    dem_path = config.dem_path
     if dem_path is None or not dem_path.exists():
         raise FileNotFoundError(f"DEM not found for calibration: {dem_path}")
 
@@ -134,32 +133,54 @@ def _residuals(params: np.ndarray,
 
 # ── Calibration runner ─────────────────────────────────────────────────
 
-def run_calibration(config: SceneConfig,
-                    verbose: bool = True) -> Dict:
+def run_calibration(
+    aocs_path: Path,
+    metadata_path: Optional[Path],
+    tie_points_path: Path,
+    dem_path: Path,
+    output_path: Path,
+    f: float = 105790.0,
+    cx: float = 2048.0,
+    cy: float = 2048.0,
+    verbose: bool = True,
+) -> Dict:
     """
     Full 3-phase calibration for a scene.
 
     Returns
     -------
     dict with keys: f, cx, cy, k1, k2, roll, pitch, yaw, time_shift, cx_rate
-    Also saves the JSON to config.calib_json.
+    Also saves the JSON to ``output_path``.
     """
-    missing = config.check_inputs("calibration")
+    missing = []
+    if not aocs_path.exists():
+        missing.append(f"AOCS: {aocs_path}")
+    if not tie_points_path.exists():
+        missing.append(f"Tie points CSV: {tie_points_path}")
+    if not dem_path.exists():
+        missing.append(f"DEM: {dem_path}")
     if missing:
         raise FileNotFoundError(
             "Missing files for calibration:\n  " + "\n  ".join(missing))
 
     logger.info("=" * 60)
-    logger.info(f"CALIBRATION — scene '{config.name}'")
+    logger.info("CALIBRATION")
     logger.info("=" * 60)
 
     # Model
-    model = create_model(config, model_class=RobustModel)
+    model = create_model(
+        aocs_path,
+        metadata_path,
+        f=f,
+        cx=cx,
+        cy=cy,
+        model_class=RobustModel,
+    )
 
     # Tie points
-    all_points = load_tie_points(str(config.tie_points_path))
+    all_points = load_tie_points(str(tie_points_path))
     logger.info("Loaded %d tie points.", len(all_points))
-    all_points = _attach_dem_heights(config, all_points)
+    all_points = _attach_dem_heights(dem_path, all_points)
     if len(all_points) < 20:
         raise RuntimeError(
             f"Not enough DEM-enriched tie points for calibration: {len(all_points)}")
@@ -264,8 +285,7 @@ def run_calibration(config: SceneConfig,
         "rmse_m": final_rmse,
     }
 
-    if config.calib_json:
-        save_calibration(calib, str(config.calib_path), stats=stats)
-        logger.info("Saved → %s", config.calib_path)
+    save_calibration(calib, str(output_path), stats=stats)
+    logger.info("Saved → %s", output_path)
 
     return calib

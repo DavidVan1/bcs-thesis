@@ -22,7 +22,7 @@ from pyproj import Transformer
 
 import rasterio
 
-from .config import SceneConfig, PHISAT_GSD_M
+from .config import PHISAT_GSD_M
 
 logger = logging.getLogger(__name__)
 
@@ -131,16 +131,21 @@ def _build_rpc_vrt(src_path: Path, vrt_path: Path, rpc_payload: dict) -> None:
     tree.write(vrt_path, encoding="UTF-8", xml_declaration=True)
 
 
-def _gdal_rpc_orthorectify(config: SceneConfig, rpc_payload: dict) -> Optional[str]:
+def _gdal_rpc_orthorectify(
+    phisat_tiff: Path,
+    dem_path: Path,
+    output_path: Path,
+    rpc_payload: dict,
+) -> Optional[str]:
     """Orthorectify with GDAL RPC warp (+ DEM). Returns output path on success."""
     if shutil.which("gdalwarp") is None or shutil.which("gdal_translate") is None:
         logger.warning("GDAL tools (gdalwarp/gdal_translate) not found.")
         return None
 
-    out_path = Path(config.ortho_path)
+    out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with rasterio.open(str(config.dem_path)) as dem_src:
+    with rasterio.open(str(dem_path)) as dem_src:
         dem_crs = dem_src.crs
         bounds = dem_src.bounds
 
@@ -163,13 +168,13 @@ def _gdal_rpc_orthorectify(config: SceneConfig, rpc_payload: dict) -> Optional[s
 
     with tempfile.TemporaryDirectory(prefix="rpc_ortho_") as tmp_dir:
         vrt_path = Path(tmp_dir) / "source_with_rpc.vrt"
-        _build_rpc_vrt(Path(config.phisat_image_path), vrt_path, rpc_payload)
+        _build_rpc_vrt(Path(phisat_tiff), vrt_path, rpc_payload)
 
         cmd = [
             "gdalwarp",
             "-overwrite",
             "-rpc",
-            "-to", f"RPC_DEM={config.dem_path}",
+            "-to", f"RPC_DEM={dem_path}",
             "-t_srs", f"EPSG:{utm_epsg}",
             "-tr", str(TARGET_GSD_M), str(TARGET_GSD_M),
             "-tap",
@@ -201,26 +206,30 @@ def _gdal_rpc_orthorectify(config: SceneConfig, rpc_payload: dict) -> Optional[s
     return str(out_path)
 
 
-def run_orthorectify_rpc(config: SceneConfig,
-                         rpc_json_path: str) -> Optional[str]:
-    """Run orthorectification for a scene using direct RPC ground->image."""
+def run_orthorectify(
+    phisat_tiff: Path,
+    dem_path: Path,
+    rpc_path: Path,
+    output_path: Path,
+) -> Path:
+    """Run orthorectification using RPC JSON and DEM."""
     missing = []
-    if config.phisat_image_path is None or not config.phisat_image_path.exists():
-        missing.append(f"PhiSat image: {config.phisat_image_path}")
-
-    if config.dem_path is None or not config.dem_path.exists():
-        missing.append(f"DEM: {config.dem_path}")
+    if not phisat_tiff.exists():
+        missing.append(f"PhiSat image: {phisat_tiff}")
+    if not dem_path.exists():
+        missing.append(f"DEM: {dem_path}")
+    if not rpc_path.exists():
+        missing.append(f"RPC JSON: {rpc_path}")
 
     if missing:
         raise FileNotFoundError(
             "Missing files for orthorectify:\n  " + "\n  ".join(missing))
 
-    rpc_path = Path(rpc_json_path)
     if not rpc_path.exists():
         raise FileNotFoundError(f"RPC JSON not found: {rpc_path}")
 
     logger.info("=" * 60)
-    logger.info("ORTHORECTIFY (RPC) — scene '%s'", config.name)
+    logger.info("ORTHORECTIFY (RPC)")
     logger.info("=" * 60)
 
     with open(rpc_path) as f:
@@ -228,7 +237,7 @@ def run_orthorectify_rpc(config: SceneConfig,
     if isinstance(rpc_payload, dict) and "rpc" in rpc_payload and isinstance(rpc_payload["rpc"], dict):
         rpc_payload = rpc_payload["rpc"]
 
-    out = _gdal_rpc_orthorectify(config, rpc_payload)
+    out = _gdal_rpc_orthorectify(phisat_tiff, dem_path, output_path, rpc_payload)
     if out is None:
         raise RuntimeError("GDAL RPC orthorectification failed")
-    return out
+    return Path(out)

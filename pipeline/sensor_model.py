@@ -388,15 +388,22 @@ def _apply_atmospheric_refraction(ray_world: np.ndarray,
 # Model factory (convenience for other modules)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def create_model(config: "SceneConfig",
-                 model_class: type = PhiSatPushbroomModel,
-                 ) -> PhiSatPushbroomModel:
+def create_model(
+    aocs_path: Path,
+    metadata_path: Optional[Path] = None,
+    *,
+    f: float = 105790.0,
+    cx: float = 2048.0,
+    cy: float = 2048.0,
+    model_class: type = PhiSatPushbroomModel,
+) -> PhiSatPushbroomModel:
     """
-    Instantiate a sensor model from a SceneConfig, load AOCS + timing.
+    Instantiate a sensor model from plain paths, load AOCS + timing.
 
     Parameters
     ----------
-    config : SceneConfig
+    aocs_path : Path
+    metadata_path : Optional[Path]
     model_class : PhiSatPushbroomModel or RobustModel
 
     Returns
@@ -406,21 +413,21 @@ def create_model(config: "SceneConfig",
     from .utils import load_metadata_timing
 
     model = model_class(
-        f=config.initial_f,
-        cx=config.cx,
-        cy=config.cy,
+        f=f,
+        cx=cx,
+        cy=cy,
     )
 
     # Load timing from metadata once
     timing = None
-    if config.metadata_path and config.metadata_path.exists():
-        timing = load_metadata_timing(str(config.metadata_path))
+    if metadata_path and metadata_path.exists():
+        timing = load_metadata_timing(str(metadata_path))
         if timing:
             model.line_time = timing["line_time"]
             logger.info("Updated line_time to %.6f s", model.line_time)
 
     # AOCS
-    model.load_aocs_metadata(str(config.aocs_path))
+    model.load_aocs_metadata(str(aocs_path))
 
     # Along-shift from metadata (reuse already-loaded timing)
     if timing and model.t0 is not None:
