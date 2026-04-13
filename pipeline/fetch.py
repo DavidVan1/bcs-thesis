@@ -215,7 +215,7 @@ def download_sentinel(
 
     _ensure_gee_initialized()
     import ee
-    # from geedim.mask import BaseImage
+    from geedim.mask import BaseImage
 
     logger.info(
         "  Sentinel-2 TCI — bounding box: "
@@ -329,25 +329,45 @@ def download_sentinel(
     logger.info("  Sentinel source CRS  : %s", native_crs)
     logger.info("  Sentinel export CRS  : %s", export_crs)
     tci_image = _make_tci(best_image)
+    gd_img = BaseImage(tci_image)
 
     logger.info("  Downloading TCI to %s ...", out_tif)
+    # if clip_to_region:
+    #     logger.info("  Export mode         : clipped to AOI+buffer")
+    #     prep_img = tci_image.gd.prepareForExport(
+    #         region=region,
+    #         scale=scale_m,
+    #         crs=native_crs,
+    #         dtype="uint8"
+    #     )
+    #     prep_img.gd.toGeoTIFF(str(out_tif), overwrite=True)
+    # else:
+    #     logger.info("  Export mode         : full Sentinel scene (no clipping)")
+    #     prep_img = tci_image.gd.prepareForExport(
+    #         scale=scale_m,
+    #         crs=native_crs,
+    #         dtype="uint8"
+    #     )
+    #     prep_img.gd.toGeoTIFF(str(out_tif), overwrite=True)
     if clip_to_region:
         logger.info("  Export mode         : clipped to AOI+buffer")
-        prep_img = tci_image.gd.prepareForExport(
+        gd_img.download(
+            str(out_tif),
             region=region,
             scale=scale_m,
             crs=native_crs,
-            dtype="uint8"
+            dtype="uint8",
+            overwrite=True,
         )
-        prep_img.gd.toGeoTIFF(str(out_tif), overwrite=True)
     else:
         logger.info("  Export mode         : full Sentinel scene (no clipping)")
-        prep_img = tci_image.gd.prepareForExport(
+        gd_img.download(
+            str(out_tif),
             scale=scale_m,
             crs=native_crs,
-            dtype="uint8"
+            dtype="uint8",
+            overwrite=True,
         )
-        prep_img.gd.toGeoTIFF(str(out_tif), overwrite=True)
         
     logger.info("  Saved: %s", out_tif)
     return out_tif
