@@ -13,7 +13,7 @@ Usage (CLI):
 
 Usage (API):
     from pipeline.fetch import run_fetch
-    run_fetch(config)
+    run_fetch(scene_dir)
 
 Google Earth Engine authentication:
     Run once before first use:
@@ -21,8 +21,10 @@ Google Earth Engine authentication:
     or inside the environment:
         python -c "import ee; ee.Authenticate()"
 """
-
 from __future__ import annotations
+import warnings
+warnings.filterwarnings("ignore", message="Couldn't find STAC entry", category=RuntimeWarning)
+
 
 import json
 import logging
@@ -38,10 +40,8 @@ from typing import Optional, Tuple
 import numpy as np
 import math
 
-from .config import SceneConfig, PROJECT_ROOT
-
 logger = logging.getLogger(__name__)
-
+import geedim
 
 # ── Constants ────────────────────────────────────────────────────────────
 ESA_TCI_DIVISOR: float = 3558.0  # Hardcoded by the ESA L1C processor
@@ -53,10 +53,8 @@ GEE_ENDPOINT: str = "https://earthengine.googleapis.com"
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _ensure_gee_initialized() -> None:
-    """Import, initialise, and validate GEE access (idempotent)."""
     try:
         import ee
-        from geedim.mask import BaseImage  # noqa: F401
     except ImportError:
         raise ImportError(
             "Google Earth Engine packages not found.\n"
@@ -188,7 +186,7 @@ def download_sentinel(
     lon_min: float, lat_min: float,
     lon_max: float, lat_max: float,
     acq_date: Optional[str],
-    output_dir: Path,
+    output_path: Path,
     *,
     date_window_days: int = 90,
     max_cloud_pct: float = 5.0,
@@ -209,18 +207,15 @@ def download_sentinel(
             2) rank by low cloud and AOI valid coverage
             3) export selected image clipped to AOI
     """
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    existing_tci = sorted(out_dir.glob("sentinel_TCI_*.tif"))
-    if existing_tci:
-        chosen = existing_tci[-1]
-        logger.info("  Sentinel-2 already exists — skipping search/download: %s", chosen.name)
-        return chosen
+    out_tif = Path(output_path)
+    out_tif.parent.mkdir(parents=True, exist_ok=True)
+    if out_tif.exists():
+        logger.info("  Sentinel-2 already exists — skipping search/download: %s", out_tif.name)
+        return out_tif
 
     _ensure_gee_initialized()
     import ee
-    from geedim.mask import BaseImage
+    # from geedim.mask import BaseImage
 
     logger.info(
         "  Sentinel-2 TCI — bounding box: "
@@ -325,12 +320,7 @@ def download_sentinel(
 
     logger.info("  Selected date       : %s", best_date)
     logger.info("  Cloud (scene-level) : %.2f%%", cloud_frac)
-
-    out_tif = out_dir / f"sentinel_TCI_{best_date}.tif"
-
-    if out_tif.exists():
-        logger.info("  Already exists — skipping download: %s", out_tif.name)
-        return out_tif
+    logger.info("  Selected date used for export: %s", best_date)
 
     native_crs = best_image.select("B4").projection().crs().getInfo()
     export_crs = "EPSG:4326"
@@ -339,28 +329,26 @@ def download_sentinel(
     logger.info("  Sentinel source CRS  : %s", native_crs)
     logger.info("  Sentinel export CRS  : %s", export_crs)
     tci_image = _make_tci(best_image)
-    gd_img = BaseImage(tci_image)
 
     logger.info("  Downloading TCI to %s ...", out_tif)
     if clip_to_region:
         logger.info("  Export mode         : clipped to AOI+buffer")
-        gd_img.download(
-            str(out_tif),
+        prep_img = tci_image.gd.prepareForExport(
             region=region,
             scale=scale_m,
             crs=native_crs,
-            dtype="uint8",
-            overwrite=True,
+            dtype="uint8"
         )
+        prep_img.gd.toGeoTIFF(str(out_tif), overwrite=True)
     else:
         logger.info("  Export mode         : full Sentinel scene (no clipping)")
-        gd_img.download(
-            str(out_tif),
+        prep_img = tci_image.gd.prepareForExport(
             scale=scale_m,
             crs=native_crs,
-            dtype="uint8",
-            overwrite=True,
+            dtype="uint8"
         )
+        prep_img.gd.toGeoTIFF(str(out_tif), overwrite=True)
+        
     logger.info("  Saved: %s", out_tif)
     return out_tif
 
@@ -384,7 +372,7 @@ def download_dem(
     """
     _ensure_gee_initialized()
     import ee
-    from geedim.mask import BaseImage
+    # from geedim.mask import BaseImage
 
     logger.info(
         "  Copernicus DEM GLO-30 — bbox: "
@@ -408,18 +396,18 @@ def download_dem(
         .clip(region)
     )
 
-    gd_img = BaseImage(dem)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     logger.info("  Downloading to %s ...", output_path)
-    gd_img.download(
-        str(output_path),
+    
+    prep_dem = dem.gd.prepareForExport(
         region=region,
         scale=scale_m,
         crs="EPSG:4326",
-        dtype="float32",
-        overwrite=True,
+        dtype="float32"
     )
+    prep_dem.gd.toGeoTIFF(str(output_path), overwrite=True)
+
     logger.info("  Saved: %s", output_path)
     return output_path
 
@@ -592,7 +580,7 @@ def download_gcps(
 # Public entry point
 # ═══════════════════════════════════════════════════════════════════════════
 
-def run_fetch(config: SceneConfig, *,
+def run_fetch(scene_dir: Path, *,
               no_gcp_chips: bool = False) -> None:
     """
     Download Sentinel-2, DEM, and GCP data for a scene.
@@ -600,12 +588,13 @@ def run_fetch(config: SceneConfig, *,
     Uses GL_scene_0.json from the PhiSat folder to derive the footprint.
     All downloads are skipped if the files already exist.
     """
+    scene_dir = Path(scene_dir)
     logger.info("=" * 60)
-    logger.info("FETCH — automatic data download — scene '%s'", config.name)
+    logger.info("FETCH — automatic data download — scene '%s'", scene_dir.name)
     logger.info("=" * 60)
 
     # ── 1. Derive footprint ────────────────────────────────────────
-    phisat_dir = config.phisat_dir_path
+    phisat_dir = scene_dir
     logger.info("  PhiSat dir : %s", phisat_dir)
 
     lon_min, lat_min, lon_max, lat_max = _load_footprint(phisat_dir)
@@ -624,42 +613,33 @@ def run_fetch(config: SceneConfig, *,
     logger.info("  Acquisition date: %s", acq_date or 'unknown')
 
     # ── 2. Sentinel-2 ──────────────────────────────────────────────
-    sentinel_dir = PROJECT_ROOT / "sentinel" / f"sentinel_{config.name}"
-    sentinel_dir.mkdir(parents=True, exist_ok=True)
-
     try:
+        sentinel_path = scene_dir / "sentinel.tif"
         s2_path = download_sentinel(
             s_lon_min, s_lat_min, s_lon_max, s_lat_max,
             acq_date=acq_date,
-            output_dir=sentinel_dir,
+            output_path=sentinel_path,
         )
-        # Update config so later stages can find it
-        config.sentinel_dir = str(
-            s2_path.parent.relative_to(PROJECT_ROOT)
-        )
-        logger.info("  Sentinel-2 dir : %s", config.sentinel_dir)
+        logger.info("  Sentinel-2 file: %s", s2_path)
     except Exception as e:
         logger.error("  Sentinel-2 download failed: %s", e)
         logger.error("    You can download manually from https://dataspace.copernicus.eu/")
 
     # ── 3. DEM ─────────────────────────────────────────────────────
-    dem_dir = PROJECT_ROOT / "DEM"
-    dem_dir.mkdir(parents=True, exist_ok=True)
-    dem_path = dem_dir / f"{config.name}.tif"
+    dem_path = scene_dir / "dem.tif"
 
     try:
         download_dem(
             s_lon_min, s_lat_min, s_lon_max, s_lat_max,
             output_path=dem_path,
         )
-        config.dem_file = str(dem_path.relative_to(PROJECT_ROOT))
-        logger.info("  DEM file : %s", config.dem_file)
+        logger.info("  DEM file : %s", dem_path)
     except Exception as e:
         logger.error("  DEM download failed: %s", e)
         logger.error("    You can download manually from https://opentopography.org/")
 
     # ── 4. GCPs ────────────────────────────────────────────────────
-    gcp_dir = PROJECT_ROOT / "gcp" / config.name
+    gcp_dir = scene_dir / "sentinel_gri"
     gcp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -669,47 +649,21 @@ def run_fetch(config: SceneConfig, *,
             include_chips=not no_gcp_chips,
         )
         if json_paths:
-            config.gcp_json = str(json_paths[0].relative_to(PROJECT_ROOT))
-            config.gcp_chip_dir = str(
-                (gcp_dir / "L1C_chips").relative_to(PROJECT_ROOT)
-            )
-            logger.info("  GCP JSON  : %s", config.gcp_json)
-            logger.info("  GCP chips : %s", config.gcp_chip_dir)
+            logger.info("  GCP JSON  : %s", json_paths[0])
+            logger.info("  GCP chips : %s", gcp_dir / "L1C_chips")
     except Exception as e:
         logger.error("  GCP download failed: %s", e)
         logger.error("    You can download manually from https://s2gri.copernicus.eu/")
 
-    # ── 5. Print config suggestion ──────────────────────────────────
-    _find_phisat_image(config)
-
     logger.info("=" * 60)
     logger.info("FETCH COMPLETE")
     logger.info("=" * 60)
-    scene_entry = {
-        "phisat_dir": config.phisat_dir,
-        "phisat_image": config.phisat_image,
-    }
-    if config.metadata_json:
-        scene_entry["metadata_json"] = config.metadata_json
-    scene_entry.update({
-        "sentinel_dir": config.sentinel_dir or f"sentinel/sentinel_{config.name}",
-        "dem_file": config.dem_file or f"DEM/{config.name}.tif",
-    })
-    if config.gcp_json:
-        scene_entry["gcp_json"] = config.gcp_json
-    scene_entry["gcp_chip_dir"] = config.gcp_chip_dir or f"gcp/{config.name}/L1C_chips"
-    if config.us_national_ortho:
-        scene_entry["us_national_ortho"] = config.us_national_ortho
-    scene_entry["initial_f"] = config.initial_f
-
-    scenes_json_path = PROJECT_ROOT / "pipeline" / "scenes.json"
-    _upsert_scene_in_json(scenes_json_path, config.name, scene_entry)
 
 
-def _find_phisat_image(config: SceneConfig) -> None:
+def _find_phisat_image(scene_dir: Path) -> Tuple[Optional[Path], Optional[Path]]:
     """
     Auto-detect the PhiSat-2 RGB band file and session metadata JSON
-    inside the PhiSat folder, updating config in place.
+    inside the PhiSat folder.
 
     Priority order:
       1. Any file whose name contains 'RGB'
@@ -717,7 +671,8 @@ def _find_phisat_image(config: SceneConfig) -> None:
          (multi-band stacked image is typically numbered last)
       3. First .tiff/.tif found
     """
-    bands_dir = config.phisat_dir_path / "bands"
+    bands_dir = scene_dir / "bands"
+    chosen: Optional[Path] = None
     if bands_dir.exists():
         candidates = sorted(bands_dir.glob("*.tiff")) + sorted(bands_dir.glob("*.tif"))
 
@@ -730,38 +685,9 @@ def _find_phisat_image(config: SceneConfig) -> None:
         else:
             chosen = None
 
-        if chosen is not None:
-            config.phisat_image = str(chosen.relative_to(config.phisat_dir_path))
+    metadata_path = None
+    for p in scene_dir.glob("session_*.json"):
+        metadata_path = p
+        break
 
-    # Auto-detect session metadata JSON
-    if config.metadata_json is None:
-        for p in config.phisat_dir_path.glob("session_*.json"):
-            config.metadata_json = p.name
-            break
-
-
-def _upsert_scene_in_json(scenes_json_path: Path, scene_name: str, scene_entry: dict) -> None:
-    """Insert or update a scene entry inside pipeline/scenes.json."""
-    scenes_json_path.parent.mkdir(parents=True, exist_ok=True)
-
-    current: dict = {}
-    if scenes_json_path.exists():
-        try:
-            with open(scenes_json_path) as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                current = loaded
-            else:
-                logger.warning("  scenes.json root is not an object; starting from empty.")
-        except Exception as exc:
-            logger.warning("  Could not parse scenes.json (%s); starting from empty.", exc)
-
-    if scene_name not in current or not isinstance(current[scene_name], dict):
-        current[scene_name] = {}
-    current[scene_name].update(scene_entry)
-
-    with open(scenes_json_path, "w") as f:
-        json.dump(current, f, indent=2)
-        f.write("\n")
-
-    logger.info("  Updated scenes index: %s (%s)", scenes_json_path, scene_name)
+    return chosen, metadata_path
