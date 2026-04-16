@@ -139,7 +139,7 @@ def run_calibration(
     tie_points_path: Path,
     dem_path: Path,
     output_path: Path,
-    f: float = 105790.0,
+    f: float = 105454.0,
     cx: float = 2048.0,
     cy: float = 2048.0,
     verbose: bool = True,
