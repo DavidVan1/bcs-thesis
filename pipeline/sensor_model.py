@@ -392,7 +392,7 @@ def create_model(
     aocs_path: Path,
     metadata_path: Optional[Path] = None,
     *,
-    f: float = 105790.0,
+    f: float = 105454.0,
     cx: float = 2048.0,
     cy: float = 2048.0,
     model_class: type = PhiSatPushbroomModel,
