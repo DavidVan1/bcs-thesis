@@ -392,7 +392,7 @@ def download_dem(
     """
     _ensure_gee_initialized()
     import ee
-    # from geedim.mask import BaseImage
+    from geedim.mask import BaseImage
 
     logger.info(
         "  Copernicus DEM GLO-30 — bbox: "
@@ -415,18 +415,28 @@ def download_dem(
         .mosaic()
         .clip(region)
     )
-
+    gd_img = BaseImage(dem)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     logger.info("  Downloading to %s ...", output_path)
-    
-    prep_dem = dem.gd.prepareForExport(
+
+    gd_img.download(
+        str(output_path),
         region=region,
         scale=scale_m,
         crs="EPSG:4326",
-        dtype="float32"
+        dtype="float32",
+        overwrite=True,
     )
-    prep_dem.gd.toGeoTIFF(str(output_path), overwrite=True)
+    
+    
+    # prep_dem = dem.gd.prepareForExport(
+    #     region=region,
+    #     scale=scale_m,
+    #     crs="EPSG:4326",
+    #     dtype="float32"
+    # )
+    # prep_dem.gd.toGeoTIFF(str(output_path), overwrite=True)
 
     logger.info("  Saved: %s", output_path)
     return output_path
