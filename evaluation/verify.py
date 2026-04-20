@@ -16,13 +16,12 @@ import logging
 import json
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import rasterio
 from rasterio.warp import reproject, Resampling, transform as rio_transform
 from rasterio.transform import Affine
 from rasterio.crs import CRS
-from rasterio.coords import BoundingBox
 
 try:
     import cv2
@@ -30,10 +29,9 @@ try:
 except ImportError:
     HAS_CV2 = False
 
-from .config import PHISAT_GSD_M
 
 # PhiSat-2 GSD (metres) — re-exported for local use
-PIXEL_SIZE: float = PHISAT_GSD_M
+PIXEL_SIZE: float = 4.75
 logger = logging.getLogger(__name__)
 
 
@@ -149,7 +147,7 @@ def _check_holdout(gcps: List[dict],
     if tie_points_path is None or not tie_points_path.exists():
         return gcps, 0
 
-    from .utils import load_tie_points
+    from ..pipeline.utils import load_tie_points
     tps = load_tie_points(str(tie_points_path))
     if not tps:
         return gcps, 0
@@ -293,8 +291,6 @@ def extract_ortho_patch_utm(
         ortho_path: str,
         chip_bounds,
         chip_crs,
-        chip_shape: Tuple[int, int],
-        chip_res: float,
         work_res: float = PIXEL_SIZE,
         margin_m: float = 200.0,
         offset_e: float = 0.0,
@@ -355,64 +351,6 @@ def extract_ortho_patch_utm(
     if np.count_nonzero(dst_array) < 0.3 * dst_array.size:
         return None
     return dst_array
-
-
-def extract_reference_chip_from_raster(
-        reference_path: str,
-        center_e: float,
-        center_n: float,
-        chip_crs,
-        chip_shape: Tuple[int, int] = (57, 57),
-        chip_res: float = 10.0,
-) -> Optional[np.ndarray]:
-    """Extract a reference chip from an arbitrary raster in a target UTM grid."""
-    h, w = chip_shape
-    half_w = 0.5 * w * chip_res
-    half_h = 0.5 * h * chip_res
-
-    chip_bounds = BoundingBox(
-        left=center_e - half_w,
-        bottom=center_n - half_h,
-        right=center_e + half_w,
-        top=center_n + half_h,
-    )
-    dst_tf = Affine(chip_res, 0, chip_bounds.left,
-                    0, -chip_res, chip_bounds.top)
-
-    with rasterio.open(reference_path) as src:
-        n_bands = src.count
-        if n_bands >= 3:
-            channels = []
-            for b in range(1, 4):
-                ch = np.zeros((h, w), dtype=np.float32)
-                reproject(
-                    source=rasterio.band(src, b),
-                    destination=ch,
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    dst_transform=dst_tf,
-                    dst_crs=chip_crs,
-                    resampling=Resampling.bilinear,
-                )
-                channels.append(ch)
-            out = (0.2989 * channels[0]
-                   + 0.5870 * channels[1]
-                   + 0.1140 * channels[2])
-        else:
-            out = np.zeros((h, w), dtype=np.float32)
-            reproject(
-                source=rasterio.band(src, 1),
-                destination=out,
-                src_transform=src.transform,
-                src_crs=src.crs,
-                dst_transform=dst_tf,
-                dst_crs=chip_crs,
-                resampling=Resampling.bilinear,
-            )
-
-    if np.count_nonzero(out) < 0.3 * out.size:
-        return None
-    return out
 
 
 def _upsample_chip_to_work_res(
@@ -609,35 +547,32 @@ def _single_pass_ncc(
         chip_crs,
         chip_bounds,
         chip_res: float,
-        chip_shape: Tuple[int, int],
         work_res: float,
         margin_m: float,
         offset_e: float = 0.0,
         offset_n: float = 0.0,
-) -> Tuple[Optional[float], Optional[float], Optional[float],
-           bool, bool, Optional[np.ndarray]]:
-    """Run one NCC pass.  Returns (dy, dx, ncc, edge_hit, no_data, chip_up).
+) -> Tuple[Optional[float], Optional[float], Optional[float], bool, bool]:
+    """Run one NCC pass.  Returns (dy, dx, ncc, edge_hit, no_data).
 
     *dy/dx* are in work_res pixels (image convention: +y down, +x right).
     *offset_e/n* shift the extraction centre for pass-2.
-    *chip_up* is the upsampled chip (returned so pass-2 can reuse it).
     """
     patch = extract_ortho_patch_utm(
-        ortho_path, chip_bounds, chip_crs, chip_shape, chip_res,
+        ortho_path, chip_bounds, chip_crs,
         work_res=work_res, margin_m=margin_m,
         offset_e=offset_e, offset_n=offset_n,
     )
     if patch is None:
-        return None, None, None, False, True, None
+        return None, None, None, False, True
 
     chip_up = _upsample_chip_to_work_res(chip_data, chip_res, work_res)
 
     try:
         dy, dx, ncc, edge_hit = gradient_ncc(chip_up, patch)
     except Exception:
-        return None, None, None, False, True, chip_up
+        return None, None, None, False, True
 
-    return dy, dx, ncc, edge_hit, False, chip_up
+    return dy, dx, ncc, edge_hit, False
 
 
 def verify_ncc(
@@ -666,6 +601,9 @@ def verify_ncc(
     MAD outlier rejection runs **after** the consistency gate as a
     final reporting filter to remove genuinely bad GCP chips.
     """
+    if reference_source != "sentinel":
+        raise ValueError("reference_source must be 'sentinel'")
+
     logger.info("\n" + "=" * 72)
     logger.info(f"METHOD B — Two-pass NCC ({reference_source})")
     logger.info("=" * 72)
@@ -676,13 +614,9 @@ def verify_ncc(
         ortho_crs = src.crs
         ortho_tf   = src.transform
 
-    require_chip = (reference_source == "sentinel")
     gcps, meta = _select_gcps(gcp_json_path, gcp_chip_dir, tie_points_path,
                               ob, ortho_data, ortho_crs, ortho_tf,
-                              require_chip=require_chip)
-
-    if reference_source != "sentinel":
-        raise ValueError("reference_source must be 'sentinel'")
+                              require_chip=True)
 
     if not gcps:
         logger.info("  No usable GCPs for selected reference source.")
@@ -708,12 +642,11 @@ def verify_ncc(
             chip_crs  = cs.crs
             chip_bounds = cs.bounds
             chip_res  = abs(cs.transform.a)
-            chip_shape = cs.shape
 
         # ── Pass 1: coarse (wide search) ─────────────────────────────
-        dy1, dx1, ncc1, edge1, no_data1, chip_up = _single_pass_ncc(
+        dy1, dx1, ncc1, edge1, no_data1 = _single_pass_ncc(
             str(ortho_path), chip_data, chip_crs, chip_bounds,
-            chip_res, chip_shape, work_res,
+            chip_res, work_res,
             margin_m=_COARSE_MARGIN_M,
         )
 
@@ -746,9 +679,9 @@ def verify_ncc(
         coarse_n = -dy1 * work_res
 
         # ── Pass 2: fine (tight search centred on coarse hit) ────────
-        dy2, dx2, ncc2, edge2, no_data2, _ = _single_pass_ncc(
+        dy2, dx2, ncc2, edge2, no_data2 = _single_pass_ncc(
             str(ortho_path), chip_data, chip_crs, chip_bounds,
-            chip_res, chip_shape, work_res,
+            chip_res, work_res,
             margin_m=_FINE_MARGIN_M,
             offset_e=coarse_e,
             offset_n=coarse_n,
@@ -841,16 +774,12 @@ def verify_ncc(
 # Unified entry point
 # ═══════════════════════════════════════════════════════════════════════════
 
-VERIFY_METHODS = ["all", "ncc"]
-
-
 def run_verify(
     ortho_path: Path,
     gcp_json_path: Path,
     gcp_chip_dir: Path,
     output_path: Path,
     tie_points_path: Optional[Path] = None,
-    method: str = "ncc",
     min_ncc: float = 0.25,
     reference_source: str = "sentinel",
 ) -> dict:
@@ -860,9 +789,6 @@ def run_verify(
     Parameters
     ----------
     ortho_path : Path
-    method : str
-        ``"ncc"`` runs NCC verification. ``"all"`` is accepted as
-        a backward-compatible alias for ``"ncc"``.
     min_ncc : float
         NCC threshold for method B.
     """
@@ -881,43 +807,15 @@ def run_verify(
         raise FileNotFoundError(
             "Missing files for verify:\n  " + "\n  ".join(missing))
 
-    if method == "position":
-        raise ValueError(
-            "Verification method 'position' was removed. "
-            "Use method='ncc'."
-        )
-
-    if method not in VERIFY_METHODS:
-        raise ValueError(
-            f"Unknown verification method '{method}'. "
-            f"Available: {', '.join(VERIFY_METHODS)}"
-        )
-
-    out: dict = {}
-
-    if method in ("all", "ncc"):
-        out["ncc"] = verify_ncc(
-                                ortho_path,
-                                gcp_json_path,
-                                gcp_chip_dir,
-                                output_path,
-                                tie_points_path=tie_points_path,
-                                min_ncc=min_ncc,
-                                reference_source=reference_source)
-
-    # Also save NCC results under the legacy path
-    if method == "all" and "ncc" in out:
-        legacy = output_path
-        ncc_res = out["ncc"]
-        _save_json(legacy,
-                   ncc_res.get("results", []),
-                   ncc_res.get("stats", {}),
-                   ncc_res.get("meta", {}),
-                   "ncc (legacy verification_results.json)")
+    ncc_out = verify_ncc(
+        ortho_path,
+        gcp_json_path,
+        gcp_chip_dir,
+        output_path,
+        tie_points_path=tie_points_path,
+        min_ncc=min_ncc,
+        reference_source=reference_source,
+    )
+    out = {"ncc": ncc_out}
 
     return out
-
-
-def run_verification(*args, **kwargs) -> dict:
-    """Backward-compatible alias for ``run_verify``."""
-    return run_verify(*args, **kwargs)
