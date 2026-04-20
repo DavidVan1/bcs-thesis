@@ -22,13 +22,12 @@ from pyproj import Transformer
 
 import rasterio
 
-from .config import PHISAT_GSD_M
 
 logger = logging.getLogger(__name__)
 
 
 # ── Constants ────────────────────────────────────────────────────────────
-TARGET_GSD_M: float = PHISAT_GSD_M     # output ground sample distance
+TARGET_GSD_M: float = 4.75
 
 
 def _gdal_subprocess_env() -> dict:
