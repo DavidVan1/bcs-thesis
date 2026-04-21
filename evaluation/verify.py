@@ -1,821 +1,115 @@
-"""
-Sentinel-2 GCP verification of orthorectified PhiSat-2 imagery.
-
-Verification method:
-
-    **GCP-chip NCC cross-correlation**
-     Match ESA Sentinel-2 L1C reference chips (57×57 @ 10 m, UTM)
-     against ortho patches using normalised cross-correlation.
-
-All methods load GCPs from *every* JSON file in the scene's GCP
-directory, exclude any GCP too near a calibration tie point, and
-report RMSE / mean error in metres and PhiSat-2 pixels (4.75 m).
-"""
-
-import logging
-import json
-import numpy as np
+import logging, json, numpy as np, cv2, rasterio, os
 from pathlib import Path
-from typing import List, Optional, Tuple
-
-import rasterio
-from rasterio.warp import reproject, Resampling, transform as rio_transform
+from typing import Tuple
+from rasterio.warp import reproject, Resampling
 from rasterio.transform import Affine
-from rasterio.crs import CRS
 
-try:
-    import cv2
-    HAS_CV2 = True
-except ImportError:
-    HAS_CV2 = False
-
-
-# PhiSat-2 GSD (metres) — re-exported for local use
-PIXEL_SIZE: float = 4.75
+PIXEL_SIZE = 4.75
 logger = logging.getLogger(__name__)
 
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (np.float32, np.float64)): return float(obj)
+        if isinstance(obj, (np.int32, np.int64)): return int(obj)
+        if isinstance(obj, np.ndarray): return obj.tolist()
+        return super().default(obj)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# GCP loading / selection  (shared)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _load_all_gcps(gcp_json_path: Path,
-                   chip_dir: Optional[Path]) -> List[dict]:
-    """
-    Load GCPs from *every* JSON in the same directory as the configured
-    GCP JSON.  De-duplicates by GCP ID.
-    """
-    gcp_dir = gcp_json_path.parent
-    json_files = sorted(gcp_dir.glob("*.json"))
-    if not json_files:
-        raise FileNotFoundError(f"No GCP JSON files in {gcp_dir}")
-
-    gcps: List[dict] = []
-    seen: set = set()
-
-    for jf in json_files:
-        with open(jf) as f:
-            db = json.load(f)
-
-        for g in db["GCP_DB"]["GCP"]:
-            gid = g["ID"]
-            if gid in seen:
-                continue
-            seen.add(gid)
-
-            gi = g["GCP_Info"]
-
-            # Resolve chip file
-            gri = g.get("GRI_List", {}).get("GRI_Measure", {})
-            if isinstance(gri, list):
-                gri = gri[0]
-            chips = gri.get("Chips", {})
-            cf = chips.get("Chip_File")
-            if isinstance(cf, dict):
-                cf = cf.get("Chip_File", cf)
-
-            chip_path = None
-            if cf is not None and chip_dir is not None:
-                chip_path = chip_dir / Path(cf).name
-                if not chip_path.exists():
-                    chip_path = chip_dir / f"{gid}_00.TIF"
-                if not chip_path.exists():
-                    chip_path = None
-
-            gcps.append(dict(
-                id=gid,
-                lon=float(gi["Longitude"]),
-                lat=float(gi["Latitude"]),
-                alt=float(gi["Altimetry"]["#text"]),
-                quality=int(g["Quality_Indicators"]["Quality_Score"]),
-                chip_path=chip_path,
-                epsg=int(gi["EPSG"]),
-                x_utm=float(gi["X"]),
-                y_utm=float(gi["Y"]),
-            ))
-
-    return gcps
-
-
-def _filter_to_ortho(gcps: List[dict],
-                     ortho_bounds,
-                     ortho_data: np.ndarray,
-                     ortho_crs,
-                     ortho_tf,
-                     require_chip: bool = True,
-                     ) -> List[dict]:
-    """Keep GCPs inside ortho footprint with non-zero data."""
-    valid: List[dict] = []
-    ortho_crs_obj = CRS.from_user_input(ortho_crs)
-    ortho_is_geographic = ortho_crs_obj.is_geographic
-
-    for g in gcps:
-        if require_chip and g["chip_path"] is None:
-            continue
-
-        if ortho_is_geographic:
-            x, y = g["lon"], g["lat"]
-        else:
-            x_t, y_t = rio_transform(
-                "EPSG:4326", ortho_crs_obj, [g["lon"]], [g["lat"]]
-            )
-            x, y = float(x_t[0]), float(y_t[0])
-
-        ob = ortho_bounds
-        if not (ob.left <= x <= ob.right
-                and ob.bottom <= y <= ob.top):
-            continue
-        col = int(round((x - ortho_tf.c) / ortho_tf.a))
-        row = int(round((y - ortho_tf.f) / ortho_tf.e))
-        if not (0 <= row < ortho_data.shape[1]
-                and 0 <= col < ortho_data.shape[2]):
-            continue
-        if ortho_data[0, row, col] == 0:
-            continue
-        g = dict(g)  # shallow copy
-        g["ortho_col"] = col
-        g["ortho_row"] = row
-        valid.append(g)
-    return valid
-
-
-def _check_holdout(gcps: List[dict],
-                   tie_points_path: Optional[Path],
-                   radius_m: float = 50.0,
-                   ) -> Tuple[List[dict], int]:
-    """Remove GCPs within *radius_m* of calibration tie points."""
-    if tie_points_path is None or not tie_points_path.exists():
-        return gcps, 0
-
-    from ..pipeline.utils import load_tie_points
-    tps = load_tie_points(str(tie_points_path))
-    if not tps:
-        return gcps, 0
-
-    tp_ll = np.array([[tp["lon"], tp["lat"]] for tp in tps])
-    rad_deg = radius_m / 111_000.0
-
-    holdout: List[dict] = []
-    excluded = 0
-    for g in gcps:
-        d = np.sqrt((tp_ll[:, 0] - g["lon"]) ** 2
-                    + (tp_ll[:, 1] - g["lat"]) ** 2)
-        if d.min() > rad_deg:
-            holdout.append(g)
-        else:
-            excluded += 1
-    return holdout, excluded
-
-
-def _select_gcps(gcp_json_path: Path,
-                 gcp_chip_dir: Path,
-                 tie_points_path: Optional[Path],
-                 ortho_bounds, ortho_data, ortho_crs, ortho_tf,
-                 require_chip: bool = True,
-                 ) -> Tuple[List[dict], dict]:
-    """
-    Full GCP selection pipeline shared by verification methods.
-
-    Returns (selected_gcps, meta_dict).
-    """
-    gcp_dir = gcp_json_path.parent
-    n_json = len(list(gcp_dir.glob("*.json")))
-
-    all_gcps = _load_all_gcps(gcp_json_path, gcp_chip_dir)
-
-    holdout, n_excl = _check_holdout(all_gcps, tie_points_path)
-
-    in_ortho = _filter_to_ortho(holdout, ortho_bounds, ortho_data,
-                                ortho_crs,
-                                ortho_tf, require_chip=require_chip)
-
-    meta = dict(
-        n_json_files=n_json,
-        n_total=len(all_gcps),
-        n_excluded_holdout=n_excl,
-        n_in_ortho=len(in_ortho),
-    )
-
-    logger.info("  Loaded %d GCPs from %d JSON file(s)", len(all_gcps), n_json)
-    if n_excl:
-        logger.info("  Excluded %d near calibration tie points", n_excl)
-    logger.info("  Inside ortho with valid data: %d", len(in_ortho))
-
-    return in_ortho, meta
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# NCC helpers  (used by method B)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _gradient_magnitude(img: np.ndarray) -> np.ndarray:
-    """Sobel gradient magnitude — removes radiometric differences,
-    keeps only structural edges."""
+def _get_gradient(img: np.ndarray) -> np.ndarray:
     img = img.astype(np.float32)
-    if HAS_CV2:
-        gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
-    else:
-        from scipy.ndimage import sobel
-        gx = sobel(img, axis=1).astype(np.float32)
-        gy = sobel(img, axis=0).astype(np.float32)
-    return np.sqrt(gx ** 2 + gy ** 2)
+    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+    return np.sqrt(gx**2 + gy**2)
 
-
-def normalised_cross_correlation(
-        template: np.ndarray,
-        image: np.ndarray,
-) -> Tuple[float, float, float, bool]:
-    """
-    Sub-pixel NCC of *template* inside *image*.
-
-    Returns ``(dy, dx, ncc_peak, edge_hit)`` — offset of template-match
-    centre relative to image centre, in pixels.  *edge_hit* is True when
-    the peak sits at the search-window border (unreliable).
-    """
-    if HAS_CV2:
-        result = cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED)
-    else:
-        from scipy.signal import correlate2d
-        t = template - template.mean()
-        i = image - image.mean()
-        result = correlate2d(i, t, mode="valid")
-        norm = np.sqrt(np.sum(t ** 2) * np.sum(i ** 2)) + 1e-12
-        result /= norm
-
-    if HAS_CV2:
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
-        px, py = max_loc
-    else:
-        max_val = result.max()
-        iy, ix = np.unravel_index(result.argmax(), result.shape)
-        px, py = int(ix), int(iy)
-
-    # Parabolic sub-pixel refinement
-    h, w = result.shape
-    dx_sub = dy_sub = 0.0
+def ncc_match(template: np.ndarray, image: np.ndarray) -> Tuple[float, float, float, bool]:
+    res = cv2.matchTemplate(_get_gradient(image), _get_gradient(template), cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+    px, py = max_loc
+    h, w = res.shape
+    dx_s = dy_s = 0.0
     if 0 < px < w - 1:
-        dx_sub = 0.5 * (result[py, px + 1] - result[py, px - 1]) / (
-            2 * result[py, px] - result[py, px + 1]
-            - result[py, px - 1] + 1e-12)
+        dx_s = 0.5 * (res[py, px+1] - res[py, px-1]) / (2 * res[py, px] - res[py, px+1] - res[py, px-1] + 1e-12)
     if 0 < py < h - 1:
-        dy_sub = 0.5 * (result[py + 1, px] - result[py - 1, px]) / (
-            2 * result[py, px] - result[py + 1, px]
-            - result[py - 1, px] + 1e-12)
+        dy_s = 0.5 * (res[py+1, px] - res[py-1, px]) / (2 * res[py, px] - res[py+1, px] - res[py-1, px] + 1e-12)
+    return (py + dy_s) - (h-1)/2.0, (px + dx_s) - (w-1)/2.0, max_val, (px <= 0 or px >= w-1 or py <= 0 or py >= h-1)
 
-    expected_x = (w - 1) / 2.0
-    expected_y = (h - 1) / 2.0
-    dx = (px + dx_sub) - expected_x
-    dy = (py + dy_sub) - expected_y
-
-    edge_hit = (px <= 0 or px >= w - 1 or py <= 0 or py >= h - 1)
-
-    return dy, dx, max_val, edge_hit
-
-
-def gradient_ncc(
-        template: np.ndarray,
-        image: np.ndarray,
-) -> Tuple[float, float, float, bool]:
-    """NCC on Sobel gradient-magnitude images.
-
-    Removes cross-sensor radiometric differences, keeps only structure.
-    """
-    return normalised_cross_correlation(
-        _gradient_magnitude(template),
-        _gradient_magnitude(image),
-    )
-
-
-def extract_ortho_patch_utm(
-        ortho_path: str,
-        chip_bounds,
-        chip_crs,
-        work_res: float = PIXEL_SIZE,
-        margin_m: float = 200.0,
-        offset_e: float = 0.0,
-        offset_n: float = 0.0,
-) -> Optional[np.ndarray]:
-    """
-    Extract a patch from the ortho reprojected to the chip's UTM grid
-    at *work_res* (default 4.75 m) with an extra *margin_m* search
-    margin (in metres).
-
-    *offset_e* / *offset_n* shift the extraction centre (in metres,
-    UTM easting / northing) — used by pass-2 of the two-pass scheme
-    to centre the fine search on the coarse estimate.
-
-    Returns float32 2-D array or None.
-    """
-    dst_left   = chip_bounds.left   - margin_m + offset_e
-    dst_bottom = chip_bounds.bottom - margin_m + offset_n
-    dst_right  = chip_bounds.right  + margin_m + offset_e
-    dst_top    = chip_bounds.top    + margin_m + offset_n
-
-    dst_w = int(round((dst_right - dst_left) / work_res))
-    dst_h = int(round((dst_top - dst_bottom) / work_res))
-    dst_tf = Affine(work_res, 0, dst_left, 0, -work_res, dst_top)
-
-    with rasterio.open(ortho_path) as src:
-        n_bands = src.count
-        if n_bands >= 3:
-            # Multi-band ortho → luminance
-            channels = []
-            for b in range(1, 4):
-                ch = np.zeros((dst_h, dst_w), dtype=np.float32)
-                reproject(
-                    source=rasterio.band(src, b),
-                    destination=ch,
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    dst_transform=dst_tf,
-                    dst_crs=chip_crs,
-                    resampling=Resampling.bilinear,
-                )
-                channels.append(ch)
-            dst_array = (0.2989 * channels[0]
-                         + 0.5870 * channels[1]
-                         + 0.1140 * channels[2])
-        else:
-            dst_array = np.zeros((dst_h, dst_w), dtype=np.float32)
-            reproject(
-                source=rasterio.band(src, 1),
-                destination=dst_array,
-                src_transform=src.transform,
-                src_crs=src.crs,
-                dst_transform=dst_tf,
-                dst_crs=chip_crs,
-                resampling=Resampling.bilinear,
-            )
-
-    if np.count_nonzero(dst_array) < 0.3 * dst_array.size:
-        return None
-    return dst_array
-
-
-def _upsample_chip_to_work_res(
-        chip_data: np.ndarray,
-        chip_res: float,
-        work_res: float = PIXEL_SIZE,
-) -> np.ndarray:
-    """Resample a chip (typically 57×57 @ 10 m) to *work_res* (4.75 m).
-
-    Uses bilinear interpolation via cv2.resize or scipy.zoom.
-    Returns float32 2-D array.
-    """
-    scale = chip_res / work_res
-    new_h = int(round(chip_data.shape[0] * scale))
-    new_w = int(round(chip_data.shape[1] * scale))
-
-    chip_f32 = chip_data.astype(np.float32)
-    if HAS_CV2:
-        return cv2.resize(chip_f32, (new_w, new_h),
-                          interpolation=cv2.INTER_LINEAR)
-    else:
-        from scipy.ndimage import zoom
-        return zoom(chip_f32, (scale, scale), order=1).astype(np.float32)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Statistics  (shared)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _compute_stats(results: List[dict]) -> dict:
-    """Compute mean, RMSE, std for easting / northing / total."""
-    if not results:
-        return {}
-
-    east  = np.array([r["east_m"]  for r in results])
-    north = np.array([r["north_m"] for r in results])
-    total = np.array([r["total_m"] for r in results])
-
-    def _axis(arr):
-        return {
-            "mean":    float(np.mean(arr)),
-            "std":     float(np.std(arr)),
-            "rmse":    float(np.sqrt(np.mean(arr ** 2))),
-            "rmse_px": float(np.sqrt(np.mean(arr ** 2)) / PIXEL_SIZE),
-        }
-
-    stats: dict = {
-        "n": len(results),
-        "easting":  _axis(east),
-        "northing": _axis(north),
-        "total": {
-            **_axis(total),
-            "median":    float(np.median(total)),
-            "median_px": float(np.median(total) / PIXEL_SIZE),
-            "ce90":      float(np.percentile(total, 90)),
-            "ce90_px":   float(np.percentile(total, 90)) / PIXEL_SIZE,
-            "max":       float(np.max(total)),
-            "min":       float(np.min(total)),
-        },
-    }
-
-    # NCC scores if present
-    nccs = [r["ncc"] for r in results if "ncc" in r]
-    if nccs:
-        ncc = np.array(nccs)
-        stats["ncc_mean"]   = float(np.mean(ncc))
-        stats["ncc_median"] = float(np.median(ncc))
-
-    # Per quality-score breakdown
-    by_q: dict = {}
-    for q in sorted(set(r["quality"] for r in results)):
-        sub = [r for r in results if r["quality"] == q]
-        t = np.array([r["total_m"] for r in sub])
-        by_q[q] = {
-            "n":       len(sub),
-            "rmse":    float(np.sqrt(np.mean(t ** 2))),
-            "rmse_px": float(np.sqrt(np.mean(t ** 2)) / PIXEL_SIZE),
-            "mean":    float(np.mean(t)),
-        }
-    stats["by_quality"] = by_q
-
-    return stats
-
-
-def _print_stats(stats: dict, meta: dict, method_label: str) -> None:
-    """Pretty-print verification statistics."""
-    ps = PIXEL_SIZE
-    logger.info("\n" + "=" * 72)
-    logger.info(f"VERIFICATION RESULTS — {method_label}")
-    logger.info("=" * 72)
-
-    logger.info(
-        f"  GCPs loaded / holdout-excluded / in ortho: "
-        f"{meta['n_total']} / {meta['n_excluded_holdout']} / "
-        f"{meta['n_in_ortho']}")
-    if "n_skipped" in meta:
-        logger.info(
-            f"  Skipped / low-quality  : "
-            f"{meta.get('n_skipped', 0)} / {meta.get('n_low_quality', 0)}")
-    if meta.get("n_inconsistent", 0):
-        logger.info(f"  Consistency-gate rejects: {meta['n_inconsistent']}")
-    if meta.get("n_outlier", 0):
-        logger.info(f"  MAD outliers removed   : {meta['n_outlier']}")
-    logger.info(f"  Successfully evaluated : {stats.get('n', 0)}")
-
-    if not stats:
-        logger.info("  (no usable results)")
-        return
-
-    for label, key in [("Easting  (cross-track)", "easting"),
-                       ("Northing (along-track)", "northing")]:
-        s = stats[key]
-        logger.info(f"\n  {label}:")
-        logger.info(f"    Mean  : {s['mean']:+8.2f} m  ({s['mean']/ps:+6.2f} px)")
-        logger.info(f"    Std   : {s['std']:8.2f} m  ({s['std']/ps:6.2f} px)")
-        logger.info(f"    RMSE  : {s['rmse']:8.2f} m  ({s['rmse_px']:6.2f} px)")
-
-    t = stats["total"]
-    logger.info("\n  Total 2-D:")
-    logger.info(f"    Mean   : {t['mean']:8.2f} m  ({t['mean']/ps:6.2f} px)")
-    logger.info(f"    Median : {t['median']:8.2f} m  ({t['median_px']:6.2f} px)")
-    logger.info(f"    CE90   : {t['ce90']:8.2f} m  ({t['ce90_px']:6.2f} px)")
-    logger.info(f"    RMSE   : {t['rmse']:8.2f} m  ({t['rmse_px']:6.2f} px)")
-    logger.info(f"    Max    : {t['max']:8.2f} m     Min : {t['min']:.2f} m")
-
-    if "ncc_mean" in stats:
-        logger.info(
-            f"\n  NCC  mean={stats['ncc_mean']:.3f}  "
-            f"median={stats['ncc_median']:.3f}")
-    if "matches_mean" in stats:
-        logger.info(
-            f"  Matches  mean={stats['matches_mean']:.0f}  "
-            f"median={stats['matches_median']:.0f}")
-
-    if stats.get("by_quality"):
-        logger.info("")
-        for q, qs in stats["by_quality"].items():
-            logger.info(
-                f"  Q{q}: n={qs['n']:3d}  "
-                f"RMSE={qs['rmse']:7.2f} m ({qs['rmse_px']:5.2f} px)  "
-                f"mean={qs['mean']:7.2f} m")
-
-    logger.info(f"\n  Pixel reference: {ps} m (PhiSat-2 GSD)")
-    logger.info("=" * 72)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# JSON I/O
-# ═══════════════════════════════════════════════════════════════════════════
-
-class _NumpyEncoder(json.JSONEncoder):
-    def default(self, o):
-        if isinstance(o, np.integer):
-            return int(o)
-        if isinstance(o, np.floating):
-            return float(o)
-        if isinstance(o, np.ndarray):
-            return o.tolist()
-        return super().default(o)
-
-
-def _save_json(path: Path, results: List[dict], stats: dict,
-               meta: dict, method: str) -> None:
-    payload = {
-        "method": method,
-        "pixel_size_m": PIXEL_SIZE,
-        **meta,
-        "stats": stats,
-        "gcps": [
-            {k: v for k, v in r.items()
-             if k not in ("chip_path",)}
-            for r in results
-        ],
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(payload, f, indent=2, cls=_NumpyEncoder)
-    logger.info("  Saved → %s", path)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# METHOD B — Two-pass GCP-chip NCC cross-correlation
-# ═══════════════════════════════════════════════════════════════════════════
-
-# Two-pass search parameters
-_COARSE_MARGIN_M  = 200.0    # pass-1 search radius (metres)
-_FINE_MARGIN_M    = 30.0     # pass-2 search radius, centred on coarse hit
-_CONSIST_THRESH_M = 30.0     # max coarse/fine disagreement (metres)
-
-
-def _single_pass_ncc(
-        ortho_path: str,
-        chip_data: np.ndarray,
-        chip_crs,
-        chip_bounds,
-        chip_res: float,
-        work_res: float,
-        margin_m: float,
-        offset_e: float = 0.0,
-        offset_n: float = 0.0,
-) -> Tuple[Optional[float], Optional[float], Optional[float], bool, bool]:
-    """Run one NCC pass.  Returns (dy, dx, ncc, edge_hit, no_data).
-
-    *dy/dx* are in work_res pixels (image convention: +y down, +x right).
-    *offset_e/n* shift the extraction centre for pass-2.
-    """
-    patch = extract_ortho_patch_utm(
-        ortho_path, chip_bounds, chip_crs,
-        work_res=work_res, margin_m=margin_m,
-        offset_e=offset_e, offset_n=offset_n,
-    )
-    if patch is None:
-        return None, None, None, False, True
-
-    chip_up = _upsample_chip_to_work_res(chip_data, chip_res, work_res)
-
-    try:
-        dy, dx, ncc, edge_hit = gradient_ncc(chip_up, patch)
-    except Exception:
-        return None, None, None, False, True
-
-    return dy, dx, ncc, edge_hit, False
-
-
-def verify_ncc(
-    ortho_path: Path,
-    gcp_json_path: Path,
-    gcp_chip_dir: Path,
-    output_path: Path,
-    tie_points_path: Optional[Path] = None,
-    min_ncc: float = 0.25,
-    reference_source: str = "sentinel",
-) -> dict:
-    """
-    Two-pass NCC verification with consistency gate.
-
-    Pass 1 (coarse): gradient-NCC at 4.75 m resolution with a wide
-    200 m search margin.  Finds the approximate offset.
-
-    Pass 2 (fine): gradient-NCC at 4.75 m with a tight 30 m margin
-    **centred on the coarse offset**.  Refines the measurement in a
-    region where false locks are unlikely.
-
-    Consistency gate: if the coarse and fine offsets disagree by more
-    than 30 m, the GCP is rejected as a probable false lock — the two
-    independent measurements don't confirm each other.
-
-    MAD outlier rejection runs **after** the consistency gate as a
-    final reporting filter to remove genuinely bad GCP chips.
-    """
-    if reference_source != "sentinel":
-        raise ValueError("reference_source must be 'sentinel'")
-
-    logger.info("\n" + "=" * 72)
-    logger.info(f"METHOD B — Two-pass NCC ({reference_source})")
-    logger.info("=" * 72)
-
+def extract_patch(ortho_path: Path, cb, chip_crs, res=PIXEL_SIZE, margin=200.0, off_e=0.0, off_n=0.0):
+    l, b, r, t = cb.left - margin + off_e, cb.bottom - margin + off_n, cb.right + margin + off_e, cb.top + margin + off_n
+    w, h = int(round((r-l)/res)), int(round((t-b)/res))
+    tf = Affine(res, 0, l, 0, -res, t)
+    
     with rasterio.open(str(ortho_path)) as src:
-        ob = src.bounds
-        ortho_data = src.read()
-        ortho_crs = src.crs
-        ortho_tf   = src.transform
-
-    gcps, meta = _select_gcps(gcp_json_path, gcp_chip_dir, tie_points_path,
-                              ob, ortho_data, ortho_crs, ortho_tf,
-                              require_chip=True)
-
-    if not gcps:
-        logger.info("  No usable GCPs for selected reference source.")
-        return dict(results=[], stats={}, meta=meta)
-
-    work_res = PIXEL_SIZE
-
-    logger.info(
-        f"\n{'ID':<16s} {'Lon':>11s} {'Lat':>10s} {'Q':>2s} "
-        f"{'dE_m':>8s} {'dN_m':>8s} {'Err_m':>8s} {'Err_px':>7s} "
-        f"{'NCC':>6s} {'gate':>6s}")
-    logger.info("─" * 90)
-
-    results: List[dict] = []
-    skipped = 0
-    low_corr = 0
-    inconsistent = 0
-
-    for gcp in gcps:
-        gid = gcp["id"]
-        with rasterio.open(gcp["chip_path"]) as cs:
-            chip_data = cs.read(1).astype(np.float32)
-            chip_crs  = cs.crs
-            chip_bounds = cs.bounds
-            chip_res  = abs(cs.transform.a)
-
-        # ── Pass 1: coarse (wide search) ─────────────────────────────
-        dy1, dx1, ncc1, edge1, no_data1 = _single_pass_ncc(
-            str(ortho_path), chip_data, chip_crs, chip_bounds,
-            chip_res, work_res,
-            margin_m=_COARSE_MARGIN_M,
-        )
-
-        if no_data1:
-            skipped += 1
-            logger.info(
-                f"{gid:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
-                f"{gcp['quality']:2d}  "
-                f"{'— insufficient ortho coverage —':>42s}")
-            continue
-
-        if edge1:
-            skipped += 1
-            logger.info(
-                f"{gid:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
-                f"{gcp['quality']:2d}  "
-                f"{'— coarse peak at border':>28s}  NCC={ncc1:.3f}")
-            continue
-
-        if ncc1 < min_ncc:
-            low_corr += 1
-            logger.info(
-                f"{gid:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
-                f"{gcp['quality']:2d}  "
-                f"{'— low coarse NCC:':>20s} {ncc1:.3f}")
-            continue
-
-        # Coarse offset in metres (UTM: +east, +north)
-        coarse_e =  dx1 * work_res
-        coarse_n = -dy1 * work_res
-
-        # ── Pass 2: fine (tight search centred on coarse hit) ────────
-        dy2, dx2, ncc2, edge2, no_data2 = _single_pass_ncc(
-            str(ortho_path), chip_data, chip_crs, chip_bounds,
-            chip_res, work_res,
-            margin_m=_FINE_MARGIN_M,
-            offset_e=coarse_e,
-            offset_n=coarse_n,
-        )
-
-        if no_data2 or edge2:
-            # Fine pass failed — fall back to coarse-only (mark it)
-            east_m, north_m, ncc = coarse_e, coarse_n, ncc1
-            gate_label = "coarse"
+        # Proper RGB to Luminance conversion
+        if src.count >= 3:
+            out = []
+            for b_idx in [1, 2, 3]:
+                buf = np.zeros((h, w), dtype=np.float32)
+                reproject(rasterio.band(src, b_idx), buf, src_transform=src.transform, src_crs=src.crs, dst_transform=tf, dst_crs=chip_crs, resampling=Resampling.bilinear)
+                out.append(buf)
+            patch = 0.2989 * out[0] + 0.5870 * out[1] + 0.1140 * out[2]
         else:
-            # Fine offset is relative to the shifted centre → add coarse
-            fine_e = coarse_e + dx2 * work_res
-            fine_n = coarse_n + (-dy2 * work_res)
+            patch = np.zeros((h, w), dtype=np.float32)
+            reproject(rasterio.band(src, 1), patch, src_transform=src.transform, src_crs=src.crs, dst_transform=tf, dst_crs=chip_crs, resampling=Resampling.bilinear)
+            
+    return patch if np.count_nonzero(patch) > 0.3 * patch.size else None
 
-            # ── Consistency gate ─────────────────────────────────────
-            disagree = np.hypot(fine_e - coarse_e, fine_n - coarse_n)
-            if disagree > _CONSIST_THRESH_M:
-                inconsistent += 1
-                logger.info(
-                    f"{gid:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
-                    f"{gcp['quality']:2d}  "
-                    f"— inconsistent: coarse={np.hypot(coarse_e,coarse_n):.1f} m "
-                    f"fine={np.hypot(fine_e,fine_n):.1f} m "
-                    f"Δ={disagree:.1f} m")
-                continue
+def verify_ncc(ortho_path: Path, gcp_json_path: Path, gcp_chip_dir: Path, output_path: Path, min_ncc: float = 0.4, **kwargs) -> dict:
+    with rasterio.open(str(ortho_path)) as src:
+        ortho_bounds, ortho_crs = src.bounds, src.crs
 
-            east_m, north_m = fine_e, fine_n
-            ncc = max(ncc1, ncc2)
-            gate_label = "ok"
+    # Load from ALL JSON files in directory
+    gcps = []
+    seen_ids = set()
+    for jf in gcp_json_path.parent.glob("*.json"):
+        with open(jf) as f:
+            for g in json.load(f)["GCP_DB"]["GCP"]:
+                if g["ID"] in seen_ids: continue
+                chip_p = gcp_chip_dir / f"{g['ID']}_00.TIF"
+                if chip_p.exists():
+                    gi = g["GCP_Info"]
+                    gcps.append({"id": g["ID"], "lon": float(gi["Longitude"]), "lat": float(gi["Latitude"]), "chip_path": chip_p})
+                    seen_ids.add(g["ID"])
 
-        if ncc < min_ncc:
-            low_corr += 1
-            logger.info(
-                f"{gid:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
-                f"{gcp['quality']:2d}  "
-                f"{'— low fine NCC:':>20s} {ncc:.3f}")
-            continue
+    results = []
+    for g in gcps:
+        with rasterio.open(g["chip_path"]) as cs:
+            chip_data, chip_crs, cb, c_res = cs.read(1), cs.crs, cs.bounds, abs(cs.transform.a)
+        
+        p1 = extract_patch(ortho_path, cb, chip_crs, margin=200.0)
+        if p1 is None: continue
+        
+        chip_up = cv2.resize(chip_data.astype(np.float32), (int(round(chip_data.shape[1]*c_res/PIXEL_SIZE)), int(round(chip_data.shape[0]*c_res/PIXEL_SIZE))), interpolation=cv2.INTER_LINEAR)
+        dy, dx, ncc, edge = ncc_match(chip_up, p1)
+        if edge or ncc < min_ncc: continue
 
-        total_m = float(np.hypot(east_m, north_m))
+        off_e, off_n = dx * PIXEL_SIZE, -dy * PIXEL_SIZE
+        p2 = extract_patch(ortho_path, cb, chip_crs, margin=30.0, off_e=off_e, off_n=off_n)
+        if p2 is None: continue
+        
+        dy2, dx2, ncc2, edge2 = ncc_match(chip_up, p2)
+        if not edge2 and ncc2 >= min_ncc:
+            fe, fn = off_e + dx2 * PIXEL_SIZE, off_n - dy2 * PIXEL_SIZE
+            if np.hypot(fe - off_e, fn - off_n) < 30.0:
+                results.append({"id": g["id"], "east_m": fe, "north_m": fn, "total_m": np.hypot(fe, fn), "ncc": ncc2})
 
-        results.append(dict(
-            id=gid, lon=gcp["lon"], lat=gcp["lat"],
-            alt=gcp["alt"], quality=gcp["quality"],
-            east_m=float(east_m), north_m=float(north_m),
-            total_m=total_m, ncc=float(ncc),
-        ))
-
-        logger.info(
-            f"{gid:<16s} {gcp['lon']:11.6f} {gcp['lat']:10.6f} "
-            f"{gcp['quality']:2d} "
-            f"{east_m:+8.1f} {north_m:+8.1f} {total_m:8.1f} "
-            f"{total_m / PIXEL_SIZE:7.2f} {ncc:6.3f} "
-            f"{gate_label:>6s}")
-
-    # ── MAD outlier rejection (post-consistency-gate) ────────────────
-    # The consistency gate already removed false locks.  MAD now only
-    # catches genuine anomalies (e.g. a GCP chip whose ground truth is
-    # itself wrong).
-    n_outlier = 0
-    if len(results) >= 5:
+    if len(results) >= 3:
+        # Robust MAD filter
         totals = np.array([r["total_m"] for r in results])
         med = np.median(totals)
         mad = np.median(np.abs(totals - med))
-        mad_sigma = 1.4826 * mad
-        cutoff = med + 3.0 * mad_sigma
-        keep = []
-        for r in results:
-            if r["total_m"] > cutoff:
-                n_outlier += 1
-                logger.info(
-                    f"  [MAD outlier] {r['id']:<16s} "
-                    f"err={r['total_m']:.1f} m  "
-                    f"(cutoff={cutoff:.1f} m)")
-            else:
-                keep.append(r)
-        results = keep
+        cutoff = med + 3.0 * (1.4826 * mad) if mad > 0 else med + 10.0
+        results = [r for r in results if r["total_m"] <= cutoff]
 
-    meta.update(n_skipped=skipped, n_low_quality=low_corr,
-                n_inconsistent=inconsistent, n_outlier=n_outlier,
-                min_ncc=min_ncc, reference_source=reference_source)
-    stats = _compute_stats(results)
-    _print_stats(stats, meta, f"Two-pass NCC ({reference_source})")
+    if not results: return {}
+    totals = np.array([r["total_m"] for r in results])
+    stats = {"n": len(results), "rmse": np.sqrt(np.mean(totals**2)), "rmse_px": np.sqrt(np.mean(totals**2))/PIXEL_SIZE,
+             "ce90": np.percentile(totals, 90), "mean": np.mean(totals)}
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump({"stats": {"total": stats}, "results": results}, f, indent=2, cls=NumpyEncoder)
+    
+    logger.info(f"Verified {stats['n']} GCPs. RMSE: {stats['rmse']:.2f} m")
+    return {"ncc": {"stats": {"total": stats}, "results": results}}
 
-    _save_json(output_path, results, stats, meta, "ncc_two_pass")
-
-    return dict(results=results, stats=stats, meta=meta)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Unified entry point
-# ═══════════════════════════════════════════════════════════════════════════
-
-def run_verify(
-    ortho_path: Path,
-    gcp_json_path: Path,
-    gcp_chip_dir: Path,
-    output_path: Path,
-    tie_points_path: Optional[Path] = None,
-    min_ncc: float = 0.25,
-    reference_source: str = "sentinel",
-) -> dict:
-    """
-    Run GCP verification for a scene.
-
-    Parameters
-    ----------
-    ortho_path : Path
-    min_ncc : float
-        NCC threshold for method B.
-    """
-    if reference_source != "sentinel":
-        raise ValueError("reference_source must be 'sentinel'")
-
-    missing = []
-    if not ortho_path.exists():
-        missing.append(f"Ortho GeoTIFF: {ortho_path}")
-    if not gcp_json_path.exists():
-        missing.append(f"GCP JSON: {gcp_json_path}")
-    if not gcp_chip_dir.exists():
-        missing.append(f"GCP chip dir: {gcp_chip_dir}")
-
-    if missing:
-        raise FileNotFoundError(
-            "Missing files for verify:\n  " + "\n  ".join(missing))
-
-    ncc_out = verify_ncc(
-        ortho_path,
-        gcp_json_path,
-        gcp_chip_dir,
-        output_path,
-        tie_points_path=tie_points_path,
-        min_ncc=min_ncc,
-        reference_source=reference_source,
-    )
-    out = {"ncc": ncc_out}
-
-    return out
+def run_verify(ortho_path, gcp_json_path, gcp_chip_dir, output_path, min_ncc=0.4, **kwargs):
+    return verify_ncc(ortho_path, gcp_json_path, gcp_chip_dir, output_path, min_ncc=min_ncc)
