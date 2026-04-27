@@ -20,10 +20,9 @@ from rasterio.warp import reproject, Resampling, transform_bounds
 from pyproj import Transformer, CRS
 import torch
 
-from .matchers import get_matcher, list_matchers
+from .matchers import get_matcher
 from .utils import (
     enhance_for_matching,
-    find_sentinel_band,
     load_satellite_image,
     save_tie_points,
 )
@@ -51,37 +50,41 @@ def _determine_common_crs(phisat_ds: rasterio.DatasetReader, sentinel_ds: raster
     return CRS.from_epsg(epsg)
 
 
-def _correct_anisotropy(transform: Affine) -> Affine:
-    """Corrects anisotropic transforms by forcing isotropic pixels if anisotropy > 1.5."""
+def _rectify_affine(transform: Affine) -> Affine:
+    """
+    Remove shear and enforce square pixels + orthogonal axes.
+    Safely catches degenerate (un-invertible) matrices.
+    """
+    # Extract vectors
     col_vec = np.array([transform.a, transform.d], dtype=float)
     row_vec = np.array([transform.b, transform.e], dtype=float)
+
+    # Compute pixel size (average of both directions)
     col_mag = float(np.linalg.norm(col_vec))
     row_mag = float(np.linalg.norm(row_vec))
-    
-    anisotropy = max(col_mag, row_mag) / max(min(col_mag, row_mag), 1e-12)
-    if anisotropy <= 1.5:
-        return transform
 
-    if row_mag < 1e-12:
-        row_dir = np.array([-col_vec[1], col_vec[0]], dtype=float)
-        row_dir /= max(float(np.linalg.norm(row_dir)), 1e-12)
-    else:
-        row_dir = row_vec / row_mag
-        
-    row_new = row_dir * col_mag
-    cross = col_vec[0] * row_vec[1] - col_vec[1] * row_vec[0]
-    cross_new = col_vec[0] * row_new[1] - col_vec[1] * row_new[0]
-    
-    if cross * cross_new < 0:
-        row_new = -row_new
-        
-    logger.info("Applied PhiSat isotropic transform correction for matching (anisotropy %.2f)", anisotropy)
-    
+    # If the matrix is degenerate (scale is 0), we cannot return it.
+    # We must apply a safe 4.7m pseudo-transform to prevent the crash.
+    if col_mag < 1e-12 or row_mag < 1e-12:
+        logger.warning("Degenerate geotransform (scale 0) detected! Applying 4.7m fallback.")
+        return Affine.translation(transform.c, transform.f) * Affine.scale(4.7, -4.7)
+
+    pixel_size = (col_mag + row_mag) / 2.0
+
+    # Normalize column direction
+    col_dir = col_vec / col_mag
+
+    # Force orthogonal row direction
+    row_dir = np.array([-col_dir[1], col_dir[0]])
+
+    # Rebuild clean transform
+    col_new = col_dir * pixel_size
+    row_new = row_dir * pixel_size
+
     return Affine(
-        col_vec[0], row_new[0], transform.c,
-        col_vec[1], row_new[1], transform.f,
+        col_new[0], row_new[0], transform.c,
+        col_new[1], row_new[1], transform.f,
     )
-
 
 def _reproject_image(
     src_img: np.ndarray, 
@@ -140,16 +143,12 @@ def create_independent_scaled_grids(
     sentinel_ds: rasterio.DatasetReader,
     margin_pixels: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, Affine, Affine, CRS, Affine]:
-    """
-    Reproject both images independently so they don't share a canvas, 
-    but share a target resolution and CRS. This prevents the large Sentinel scene
-    from shrinking the PhiSat image during deep-learning resize steps.
-    """
+    
     logger.info("Projecting images to independent virtual geometries...")
 
-    # 1. Coordinate Reference System Setup
     common_crs = _determine_common_crs(phisat_ds, sentinel_ds)
-    phisat_src_transform = _correct_anisotropy(phisat_ds.transform)
+    
+    phisat_src_transform = _rectify_affine(phisat_ds.transform)
 
     # 2. Calculate Bounds
     phisat_corners = [
@@ -167,15 +166,6 @@ def create_independent_scaled_grids(
     sen_bounds = transform_bounds(
         sentinel_ds.crs, common_crs, *sentinel_ds.bounds, densify_pts=21
     )
-
-    # 3. Check Overlap
-    inter_left = max(phi_bounds[0], sen_bounds[0])
-    inter_bottom = max(phi_bounds[1], sen_bounds[1])
-    inter_right = min(phi_bounds[2], sen_bounds[2])
-    inter_top = min(phi_bounds[3], sen_bounds[3])
-
-    if inter_right <= inter_left or inter_top <= inter_bottom:
-        raise ValueError("No overlap between PhiSat and Sentinel after CRS harmonization")
 
     # 4. Calculate Resolution Target
     phi_res_x = abs((phi_bounds[2] - phi_bounds[0]) / max(1, phisat_ds.width))
@@ -303,7 +293,6 @@ def visualize_matches(image0: np.ndarray, image1: np.ndarray,
     logger.info("  Saved match visualisation → %s", output_path)
 
 
-# ── Full matching pipeline ─────────────────────────────────────────────
 
 def run_matching(
     phisat_tiff: Path,

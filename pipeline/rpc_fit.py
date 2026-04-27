@@ -89,10 +89,10 @@ def fit_rpc(
     calibration_path: Path,
     dem_path: Path,
     output_path: Path,
-    aocs_path: Path,
+    aocs_path: Path, 
     metadata_path: Optional[Path] = None,
-    grid_size: int = 64,
-    f: float = 105790.0,
+    grid_size: int = 80,
+    f: float = 105454.0,
     cx: float = 2048.0,
     cy: float = 2048.0,
 ) -> Path:
@@ -114,20 +114,22 @@ def fit_rpc(
     )
     calib = load_calibration(str(calibration_path))
 
-    params = np.array([
-        float(calib.get("time_shift", 0.0)),
-        float(calib.get("roll", 0.0)),
-        float(calib.get("pitch", 0.0)),
-        float(calib.get("yaw", 0.0)),
-        float(calib.get("f", model.f)) / float(model.f),
-        float(calib.get("k1", 0.0)),
-        float(calib.get("k2", 0.0)),
-        float(calib.get("cx_rate", 0.0)),
-        float(calib.get("along_rate", 0.0)),
-        float(calib.get("roll_rate", 0.0)),
-        float(calib.get("pitch_rate", 0.0)),
-        float(calib.get("yaw_rate", 0.0)),
-    ], dtype=np.float64)
+    params = {
+        "time_shift": float(calib.get("time_shift", 0.0)),
+        "boresight_roll": float(calib.get("boresight_roll", calib.get("roll", 0.0))),
+        "boresight_pitch": float(calib.get("boresight_pitch", calib.get("pitch", 0.0))),
+        "boresight_yaw": float(calib.get("boresight_yaw", calib.get("yaw", 0.0))),
+        "f_scale": float(calib.get("f_scale", float(calib.get("f", model.f)) / float(model.f))),
+        "k1": float(calib.get("k1", 0.0)),
+        "k2": float(calib.get("k2", 0.0)),
+        "cx_bias": float(calib.get("cx_bias", 0.0)),
+        "cy_bias": float(calib.get("cy_bias", 0.0)),
+        "drift_roll_1": float(calib.get("drift_roll_1", calib.get("roll_rate", 0.0))),
+        "drift_pitch_1": float(calib.get("drift_pitch_1", calib.get("pitch_rate", 0.0))),
+        "drift_yaw_1": float(calib.get("drift_yaw_1", calib.get("yaw_rate", 0.0))),
+        "cx_rate": float(calib.get("cx_rate", 0.0)),
+        "along_rate": float(calib.get("along_rate", 0.0)),
+    }
 
 
     with rasterio.open(str(phisat_tiff)) as src:

@@ -3,6 +3,7 @@
 !/pipeline/
 !/third_party/
 !/environment.yml
+!/evaluation/
 
 *.md
 scenes.json
