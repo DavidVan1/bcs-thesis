@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import rasterio
 
-from pipeline.config import get_scene_config
 from pipeline.sensor_model import RobustModel, create_model
 from pipeline.utils import load_calibration
 
@@ -53,11 +53,10 @@ def _fit_rational_rpc_component(target_n: np.ndarray, terms: np.ndarray) -> tupl
     den[1:] = coeff[20:]
     return num, den
 
-def _get_dem_height_range(cfg) -> tuple[float, float]:
+def _get_dem_height_range(dem_path: Path) -> tuple[float, float]:
     """Return (h_min, h_max) from DEM valid pixels for the whole scene."""
     fallback = (-500.0, 5000.0)
 
-    dem_path = cfg.dem_path
     if dem_path is None or not dem_path.exists():
         return fallback
 
@@ -86,40 +85,54 @@ def _get_dem_height_range(cfg) -> tuple[float, float]:
 
 
 def fit_rpc(
-    scene: str,
-    matcher: str,
-    grid_size: int = 64,
-    output_path: str | None = None,
+    phisat_tiff: Path,
+    calibration_path: Path,
+    dem_path: Path,
+    output_path: Path,
+    aocs_path: Path, 
+    metadata_path: Optional[Path] = None,
+    grid_size: int = 80,
+    f: float = 105454.0,
+    cx: float = 2048.0,
+    cy: float = 2048.0,
 ) -> Path:
     """Fit RPC coefficients from calibrated rigorous model and DEM height span."""
-    cfg = get_scene_config(scene)
-    cfg.set_matcher(matcher)
+    if not phisat_tiff.exists():
+        raise FileNotFoundError(f"PhiSat image not found: {phisat_tiff}")
+    if not calibration_path.exists():
+        raise FileNotFoundError(f"Calibration not found: {calibration_path}")
+    if not aocs_path.exists():
+        raise FileNotFoundError(f"AOCS not found: {aocs_path}")
 
-    if cfg.calib_path is None or not cfg.calib_path.exists():
-        raise FileNotFoundError(
-            f"Calibration not found: {cfg.calib_path}. Run matching+calibration first."
-        )
+    model = create_model(
+        aocs_path,
+        metadata_path,
+        f=f,
+        cx=cx,
+        cy=cy,
+        model_class=RobustModel,
+    )
+    calib = load_calibration(str(calibration_path))
 
-    model = create_model(cfg, model_class=RobustModel)
-    calib = load_calibration(str(cfg.calib_path))
+    params = {
+        "time_shift": float(calib.get("time_shift", 0.0)),
+        "boresight_roll": float(calib.get("boresight_roll", calib.get("roll", 0.0))),
+        "boresight_pitch": float(calib.get("boresight_pitch", calib.get("pitch", 0.0))),
+        "boresight_yaw": float(calib.get("boresight_yaw", calib.get("yaw", 0.0))),
+        "f_scale": float(calib.get("f_scale", float(calib.get("f", model.f)) / float(model.f))),
+        "k1": float(calib.get("k1", 0.0)),
+        "k2": float(calib.get("k2", 0.0)),
+        "cx_bias": float(calib.get("cx_bias", 0.0)),
+        "cy_bias": float(calib.get("cy_bias", 0.0)),
+        "drift_roll_1": float(calib.get("drift_roll_1", calib.get("roll_rate", 0.0))),
+        "drift_pitch_1": float(calib.get("drift_pitch_1", calib.get("pitch_rate", 0.0))),
+        "drift_yaw_1": float(calib.get("drift_yaw_1", calib.get("yaw_rate", 0.0))),
+        "cx_rate": float(calib.get("cx_rate", 0.0)),
+        "along_rate": float(calib.get("along_rate", 0.0)),
+    }
 
-    params = np.array([
-        float(calib.get("time_shift", 0.0)),
-        float(calib.get("roll", 0.0)),
-        float(calib.get("pitch", 0.0)),
-        float(calib.get("yaw", 0.0)),
-        float(calib.get("f", model.f)) / float(model.f),
-        float(calib.get("k1", 0.0)),
-        float(calib.get("k2", 0.0)),
-        float(calib.get("cx_rate", 0.0)),
-        float(calib.get("along_rate", 0.0)),
-        float(calib.get("roll_rate", 0.0)),
-        float(calib.get("pitch_rate", 0.0)),
-        float(calib.get("yaw_rate", 0.0)),
-    ], dtype=np.float64)
 
-
-    with rasterio.open(str(cfg.phisat_image_path)) as src:
+    with rasterio.open(str(phisat_tiff)) as src:
         image_w = int(src.width)
         image_h = int(src.height)
 
@@ -128,7 +141,7 @@ def fit_rpc(
     ys = np.linspace(0.0, image_h - 1.0, grid_size, dtype=np.float64)
 
     # 3D grid in DEM-derived global height range for this scene.
-    h_min, h_max = _get_dem_height_range(cfg)
+    h_min, h_max = _get_dem_height_range(dem_path)
     height_levels = np.linspace(h_min, h_max, 5, dtype=np.float64)
     print(f"Using DEM height range: [{h_min:.3f}, {h_max:.3f}] m")
     print(f"Height levels: {height_levels}")
@@ -226,12 +239,7 @@ def fit_rpc(
     }
 
 
-    if output_path is None:
-        out_path = cfg.output_dir / f"rpc_{matcher}.json"
-    else:
-        out_path = Path(output_path)
-
-
+    out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(rpc, indent=2))
 

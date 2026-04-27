@@ -337,7 +337,7 @@ class EfficientLoFTRMatcher(BaseMatcher):
         # Instantiate and load weights
         ckpt_path = _eloftr_root / "weights" / "eloftr_outdoor.ckpt"
         try:
-            ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
+            ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
         except (TypeError, pickle.UnpicklingError, RuntimeError) as exc:
             logger.warning(
                 "  EfficientLoFTR checkpoint is not weights-only compatible (%s). "

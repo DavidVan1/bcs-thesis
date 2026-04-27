@@ -23,16 +23,79 @@ Available matchers: lightglue, aliked, xoftr, loftr, efficientloftr, roma, mast3
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Optional, Sequence
 
-from .config import get_scene_config, list_scenes, SceneConfig
+from .config import get_scene_config, list_scenes, SceneConfig, PROJECT_ROOT
 from .profiler import PipelineProfile, profile_stage, _gpu_available
+from .utils import configure_pipeline_file_logger, log_pipeline_stage
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_float(value: object) -> float | None:
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _read_match_metrics(ctx: StageContext) -> Dict[str, float | int]:
+    metrics: Dict[str, float | int] = {}
+    stats_path = ctx.config.output_dir / f"matching_stats_{ctx.matcher_name}.json"
+    if stats_path.exists():
+        try:
+            payload = json.loads(stats_path.read_text())
+            raw_matches = payload.get("raw_matches")
+            inliers_after_ransac = payload.get("inliers_after_ransac")
+            if isinstance(raw_matches, int):
+                metrics["raw_matches"] = raw_matches
+            if isinstance(inliers_after_ransac, int):
+                metrics["inliers_after_ransac"] = inliers_after_ransac
+        except Exception:
+            pass
+
+    if "inliers_after_ransac" not in metrics and ctx.config.tie_points_path.exists():
+        with ctx.config.tie_points_path.open(newline="") as f:
+            metrics["inliers_after_ransac"] = sum(1 for _ in csv.DictReader(f))
+    return metrics
+
+
+def _read_calibration_metrics(ctx: StageContext) -> Dict[str, float | int]:
+    if not ctx.config.calib_path.exists():
+        return {}
+    try:
+        payload = json.loads(ctx.config.calib_path.read_text())
+    except Exception:
+        return {}
+
+    stats = payload.get("stats", {}) if isinstance(payload, dict) else {}
+    rmse = _safe_float(stats.get("rmse_m") if isinstance(stats, dict) else None)
+    return {"calib_rmse": rmse} if rmse is not None else {}
+
+
+def _read_verify_metrics(ctx: StageContext) -> Dict[str, float | int]:
+    if not ctx.config.verification_json_path.exists():
+        return {}
+    try:
+        payload = json.loads(ctx.config.verification_json_path.read_text())
+    except Exception:
+        return {}
+
+    ncc = payload.get("ncc", {}) if isinstance(payload, dict) else {}
+    stats = ncc.get("stats", {}) if isinstance(ncc, dict) else {}
+    total = stats.get("total", {}) if isinstance(stats, dict) else {}
+    verify_rmse = _safe_float(total.get("rmse") if isinstance(total, dict) else None)
+    ce90 = _safe_float(total.get("ce90") if isinstance(total, dict) else None)
+
+    metrics: Dict[str, float | int] = {}
+    if verify_rmse is not None:
+        metrics["verify_rmse"] = verify_rmse
+    if ce90 is not None:
+        metrics["ce90"] = ce90
+    return metrics
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -41,7 +104,7 @@ logger = logging.getLogger(__name__)
 
 MATCHER_CHOICES: Sequence[str] = (
     "lightglue", "aliked", "xoftr", "loftr",
-    "efficientloftr", "roma", "mast3r", "dust3r",
+    "efficientloftr", "roma", "mast3r", "dust3r", "dkm",
 )
 
 # Ordered sequence of stages in their natural pipeline order.
@@ -62,7 +125,6 @@ class StageContext:
     """Runtime context passed to every stage runner."""
     config: SceneConfig
     matcher_name: str = "lightglue"
-    verify_method: str = "ncc"
     reference_source: str = "sentinel"
     no_gcp_chips: bool = False
     rpc_grid_size: int = 80
@@ -92,7 +154,7 @@ def register_stage(name: str) -> Callable[[StageRunner], StageRunner]:
 def _run_fetch(ctx: StageContext) -> None:
     """Download Sentinel-2, DEM and GCPs from Google Earth Engine / Copernicus."""
     from .fetch import run_fetch
-    run_fetch(ctx.config,
+    run_fetch(ctx.config.phisat_dir_path,
               no_gcp_chips=ctx.no_gcp_chips)
 
 
@@ -100,14 +162,35 @@ def _run_fetch(ctx: StageContext) -> None:
 def _run_match(ctx: StageContext) -> None:
     """Run the feature matching stage."""
     from .matching import run_matching
-    run_matching(ctx.config, matcher_name=ctx.matcher_name)
+    sentinel_tiff = ctx.config.phisat_dir_path / "sentinel.tif"
+    if not sentinel_tiff.exists():
+        raise FileNotFoundError(f"Missing sentinel.tif in {ctx.config.phisat_dir_path}")
+    run_matching(
+        ctx.config.phisat_image_path,
+        sentinel_tiff,
+        ctx.config.output_dir,
+        ctx.config.tie_points_path,
+        matcher_name=ctx.matcher_name,
+        margin_pixels=ctx.config.margin_pixels,
+        max_keypoints=ctx.config.max_keypoints,
+    )
 
 
 @register_stage("calibrate")
 def _run_calibrate(ctx: StageContext) -> None:
     """Run the sensor calibration stage."""
     from .calibration import run_calibration
-    run_calibration(ctx.config, verbose=True)
+    run_calibration(
+        ctx.config.aocs_path,
+        ctx.config.metadata_path,
+        ctx.config.tie_points_path,
+        ctx.config.dem_path,
+        ctx.config.calib_path,
+        f=ctx.config.initial_f,
+        cx=ctx.config.cx,
+        cy=ctx.config.cy,
+        verbose=True,
+    )
 
 
 @register_stage("rpc_fit")
@@ -115,31 +198,45 @@ def _run_rpc_fit(ctx: StageContext) -> None:
     """Fit RPC model from calibrated rigorous geometry."""
     from .rpc_fit import fit_rpc
     fit_rpc(
-        scene=ctx.config.name,
-        matcher=ctx.matcher_name,
+        phisat_tiff=ctx.config.phisat_image_path,
+        calibration_path=ctx.config.calib_path,
+        dem_path=ctx.config.dem_path,
+        output_path=Path(ctx.rpc_output),
+        aocs_path=ctx.config.aocs_path,
+        metadata_path=ctx.config.metadata_path,
         grid_size=ctx.rpc_grid_size,
-        output_path=ctx.rpc_output,
+        f=ctx.config.initial_f,
+        cx=ctx.config.cx,
+        cy=ctx.config.cy,
     )
 
 
 @register_stage("orthorectify")
 def _run_orthorectify(ctx: StageContext) -> None:
     """Run the orthorectification stage."""
-    from .orthorectify import run_orthorectify_rpc
+    from ..validation.orthorectify import run_orthorectify
     if not ctx.rpc_json:
         raise ValueError("orthorectify requires an RPC JSON path")
-    run_orthorectify_rpc(
-        ctx.config,
-        rpc_json_path=ctx.rpc_json,
+    run_orthorectify(
+        ctx.config.phisat_image_path,
+        ctx.config.dem_path,
+        Path(ctx.rpc_json),
+        ctx.config.ortho_path,
     )
 
 
 @register_stage("verify")
 def _run_verify(ctx: StageContext) -> None:
     """Run NCC-based GCP verification."""
-    from .verify import run_verification
-    run_verification(ctx.config, method=ctx.verify_method,
-                     reference_source=ctx.reference_source)
+    from ..validation.verify import run_verify
+    run_verify(
+        ctx.config.ortho_path,
+        ctx.config.gcp_json_path,
+        ctx.config.gcp_chip_dir_path,
+        ctx.config.verification_json_path,
+        tie_points_path=ctx.config.tie_points_path,
+        reference_source=ctx.reference_source,
+    )
 
 
 # ── Pipeline orchestrator ──────────────────────────────────────────────
@@ -163,6 +260,7 @@ def run_pipeline(ctx: StageContext,
     logger.info("=" * 70 + "\n")
 
     has_gpu = _gpu_available() if ctx.profile else False
+    configure_pipeline_file_logger()
     pipeline_prof = PipelineProfile(
         scene=ctx.config.name,
         matcher=ctx.matcher_name,
@@ -174,17 +272,43 @@ def run_pipeline(ctx: StageContext,
             raise ValueError(f"Unknown stage '{name}'. "
                              f"Available: {', '.join(_STAGE_REGISTRY)}")
 
-        if ctx.profile:
-            use_gpu = has_gpu and name in _GPU_STAGES
-            with profile_stage(name, use_gpu=use_gpu) as prof:
+        try:
+            if ctx.profile:
+                use_gpu = has_gpu and name in _GPU_STAGES
+                with profile_stage(name, use_gpu=use_gpu) as prof:
+                    runner(ctx)
+                pipeline_prof.stages.append(prof)
+                logger.info(
+                    "   %s finished in %.2f s  |  RSS %.0f MB  |  CPU %.0f%%",
+                    name, prof.wall_time_s, prof.peak_rss_mb, prof.cpu_percent,
+                )
+            else:
                 runner(ctx)
-            pipeline_prof.stages.append(prof)
-            logger.info(
-                "   %s finished in %.2f s  |  RSS %.0f MB  |  CPU %.0f%%",
-                name, prof.wall_time_s, prof.peak_rss_mb, prof.cpu_percent,
+
+            metrics: Dict[str, float | int] = {}
+            if name == "match":
+                metrics = _read_match_metrics(ctx)
+            elif name == "calibrate":
+                metrics = _read_calibration_metrics(ctx)
+            elif name == "verify":
+                metrics = _read_verify_metrics(ctx)
+
+            log_pipeline_stage(
+                scene=ctx.config.name,
+                matcher=ctx.matcher_name,
+                stage=name,
+                status="OK",
+                metrics=metrics,
             )
-        else:
-            runner(ctx)
+        except Exception as exc:
+            log_pipeline_stage(
+                scene=ctx.config.name,
+                matcher=ctx.matcher_name,
+                stage=name,
+                status="FAIL",
+                reason=str(exc),
+            )
+            raise
 
     logger.info("\n" + "=" * 70)
     logger.info("  PIPELINE COMPLETE")
@@ -214,12 +338,15 @@ def _build_config(args: argparse.Namespace) -> SceneConfig:
     # Scene not in scenes.json — allow fetch to bootstrap it
     if args.stage == "fetch" and args.phisat_dir:
         from .fetch import _find_phisat_image
+        chosen_image, metadata_json = _find_phisat_image(PROJECT_ROOT / args.phisat_dir)
+        if chosen_image is None:
+            raise FileNotFoundError(f"No PhiSat TIFF found in {(PROJECT_ROOT / args.phisat_dir) / 'bands'}")
         config = SceneConfig(
             name=args.scene,
             phisat_dir=args.phisat_dir,
-            phisat_image="bands/Bp_0_0_4096_4096_0_0_4096_4096_12_RGB.tiff",
+            phisat_image=str(chosen_image.relative_to(PROJECT_ROOT / args.phisat_dir)),
+            metadata_json=metadata_json.name if metadata_json else None,
         )
-        _find_phisat_image(config)
         return config
 
     logger.error(
@@ -275,11 +402,6 @@ def main() -> None:
         help="Skip downloading GCP reference chips during fetch.",
     )
     parser.add_argument(
-        "--verify-method", type=str, default="ncc",
-        choices=["all", "ncc"],
-        help="Verification method: 'ncc'. 'all' is kept as a compatibility alias. Default: ncc.",
-    )
-    parser.add_argument(
         "--reference-source", type=str, default="sentinel",
         choices=["sentinel"],
         help=(
@@ -313,7 +435,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     # ── Info queries ───────────────────────────────────────────────
     if args.list_scenes:
@@ -340,7 +466,6 @@ def main() -> None:
     ctx = StageContext(
         config=config,
         matcher_name=args.matcher,
-        verify_method=args.verify_method,
         reference_source=args.reference_source,
         no_gcp_chips=getattr(args, "no_gcp_chips", False),
         rpc_grid_size=getattr(args, "rpc_grid_size", 80),

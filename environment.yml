@@ -1,36 +1,31 @@
 name: phis
-
 channels:
   - pytorch
   - nvidia
   - conda-forge
   - defaults
-
 dependencies:
   - python=3.10
   - pip
-
   - pytorch::pytorch>=2.0
   - pytorch::torchvision>=0.15
   - pytorch::pytorch-cuda=12.1
-
-  - conda-forge::rasterio>=1.3
-  - conda-forge::pyproj>=3.5
-  - conda-forge::shapely>=2.0
-  - conda-forge::libgdal-jp2openjpeg
-
   - conda-forge::numpy>=1.24
   - conda-forge::scipy>=1.10
   - conda-forge::pandas
+  - conda-forge::psutil
+  - conda-forge::opencv
   - conda-forge::matplotlib>=3.7
   - conda-forge::tqdm>=4.65
   - conda-forge::scikit-learn>=1.3
-  - conda-forge::psutil
-  - conda-forge::opencv
+  - conda-forge::rasterio
+  - conda-forge::pyproj
+  - conda-forge::shapely
+  - conda-forge::libgdal-jp2openjpeg
   - conda-forge::huggingface_hub
-
   - pip:
-    - "setuptools<82.0.0"      
+    - "setuptools<82.0.0"
+    - wheel
     - kornia>=0.7
     - Pillow>=10.0
     - affine>=2.4
@@ -38,5 +33,8 @@ dependencies:
     - pycolmap
     - earthengine-api
     - geedim
-    - -r third_party/LightGlue/requirements.txt
-    - -r third_party/EfficientLoFTR/requirements.txt
+
+# Create:  conda env create -f environment.yml
+# Update:  conda env update -f environment.yml --prune
+# Activate: conda activate phisat
+# Run:     python -m pipeline.run sf

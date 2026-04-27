@@ -20,11 +20,9 @@ from rasterio.warp import reproject, Resampling, transform_bounds
 from pyproj import Transformer, CRS
 import torch
 
-from .config import SceneConfig
-from .matchers import get_matcher, list_matchers
+from .matchers import get_matcher
 from .utils import (
     enhance_for_matching,
-    find_sentinel_band,
     load_satellite_image,
     save_tie_points,
 )
@@ -52,37 +50,41 @@ def _determine_common_crs(phisat_ds: rasterio.DatasetReader, sentinel_ds: raster
     return CRS.from_epsg(epsg)
 
 
-def _correct_anisotropy(transform: Affine) -> Affine:
-    """Corrects anisotropic transforms by forcing isotropic pixels if anisotropy > 1.5."""
+def _rectify_affine(transform: Affine) -> Affine:
+    """
+    Remove shear and enforce square pixels + orthogonal axes.
+    Safely catches degenerate (un-invertible) matrices.
+    """
+    # Extract vectors
     col_vec = np.array([transform.a, transform.d], dtype=float)
     row_vec = np.array([transform.b, transform.e], dtype=float)
+
+    # Compute pixel size (average of both directions)
     col_mag = float(np.linalg.norm(col_vec))
     row_mag = float(np.linalg.norm(row_vec))
-    
-    anisotropy = max(col_mag, row_mag) / max(min(col_mag, row_mag), 1e-12)
-    if anisotropy <= 1.5:
-        return transform
 
-    if row_mag < 1e-12:
-        row_dir = np.array([-col_vec[1], col_vec[0]], dtype=float)
-        row_dir /= max(float(np.linalg.norm(row_dir)), 1e-12)
-    else:
-        row_dir = row_vec / row_mag
-        
-    row_new = row_dir * col_mag
-    cross = col_vec[0] * row_vec[1] - col_vec[1] * row_vec[0]
-    cross_new = col_vec[0] * row_new[1] - col_vec[1] * row_new[0]
-    
-    if cross * cross_new < 0:
-        row_new = -row_new
-        
-    logger.info("Applied PhiSat isotropic transform correction for matching (anisotropy %.2f)", anisotropy)
-    
+    # If the matrix is degenerate (scale is 0), we cannot return it.
+    # We must apply a safe 4.7m pseudo-transform to prevent the crash.
+    if col_mag < 1e-12 or row_mag < 1e-12:
+        logger.warning("Degenerate geotransform (scale 0) detected! Applying 4.7m fallback.")
+        return Affine.translation(transform.c, transform.f) * Affine.scale(4.7, -4.7)
+
+    pixel_size = (col_mag + row_mag) / 2.0
+
+    # Normalize column direction
+    col_dir = col_vec / col_mag
+
+    # Force orthogonal row direction
+    row_dir = np.array([-col_dir[1], col_dir[0]])
+
+    # Rebuild clean transform
+    col_new = col_dir * pixel_size
+    row_new = row_dir * pixel_size
+
     return Affine(
-        col_vec[0], row_new[0], transform.c,
-        col_vec[1], row_new[1], transform.f,
+        col_new[0], row_new[0], transform.c,
+        col_new[1], row_new[1], transform.f,
     )
-
 
 def _reproject_image(
     src_img: np.ndarray, 
@@ -141,16 +143,12 @@ def create_independent_scaled_grids(
     sentinel_ds: rasterio.DatasetReader,
     margin_pixels: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, Affine, Affine, CRS, Affine]:
-    """
-    Reproject both images independently so they don't share a canvas, 
-    but share a target resolution and CRS. This prevents the large Sentinel scene
-    from shrinking the PhiSat image during deep-learning resize steps.
-    """
+    
     logger.info("Projecting images to independent virtual geometries...")
 
-    # 1. Coordinate Reference System Setup
     common_crs = _determine_common_crs(phisat_ds, sentinel_ds)
-    phisat_src_transform = _correct_anisotropy(phisat_ds.transform)
+    
+    phisat_src_transform = _rectify_affine(phisat_ds.transform)
 
     # 2. Calculate Bounds
     phisat_corners = [
@@ -168,15 +166,6 @@ def create_independent_scaled_grids(
     sen_bounds = transform_bounds(
         sentinel_ds.crs, common_crs, *sentinel_ds.bounds, densify_pts=21
     )
-
-    # 3. Check Overlap
-    inter_left = max(phi_bounds[0], sen_bounds[0])
-    inter_bottom = max(phi_bounds[1], sen_bounds[1])
-    inter_right = min(phi_bounds[2], sen_bounds[2])
-    inter_top = min(phi_bounds[3], sen_bounds[3])
-
-    if inter_right <= inter_left or inter_top <= inter_bottom:
-        raise ValueError("No overlap between PhiSat and Sentinel after CRS harmonization")
 
     # 4. Calculate Resolution Target
     phi_res_x = abs((phi_bounds[2] - phi_bounds[0]) / max(1, phisat_ds.width))
@@ -304,10 +293,16 @@ def visualize_matches(image0: np.ndarray, image1: np.ndarray,
     logger.info("  Saved match visualisation → %s", output_path)
 
 
-# ── Full matching pipeline ─────────────────────────────────────────────
 
-def run_matching(config: SceneConfig,
-                 matcher_name: str = "lightglue") -> List[Dict]:
+def run_matching(
+    phisat_tiff: Path,
+    sentinel_tiff: Path,
+    output_dir: Path,
+    tie_points_path: Path,
+    matcher_name: str = "lightglue",
+    margin_pixels: int = 512,
+    max_keypoints: int = 2048,
+) -> List[Dict]:
     """
     Run the full matching pipeline for a scene:
       1. Load PhiSat + Sentinel
@@ -320,37 +315,37 @@ def run_matching(config: SceneConfig,
 
     Parameters
     ----------
-    config : SceneConfig
+    phisat_tiff : Path
+    sentinel_tiff : Path
+    output_dir : Path
+    tie_points_path : Path
     matcher_name : str
         One of: lightglue, xoftr, loftr, roma, mast3r, dust3r.
 
     Returns list of tie-point dicts.
     """
-    missing = config.check_inputs("matching")
+    missing = []
+    if not phisat_tiff.exists():
+        missing.append(f"PhiSat image: {phisat_tiff}")
+    if not sentinel_tiff.exists():
+        missing.append(f"Sentinel image: {sentinel_tiff}")
     if missing:
         raise FileNotFoundError(
             "Missing files for matching:\n  " + "\n  ".join(missing))
 
     logger.info("=" * 60)
-    logger.info("MATCHING — scene '%s'  matcher=%s", config.name, matcher_name)
+    logger.info("MATCHING — matcher=%s", matcher_name)
     logger.info("=" * 60)
 
-    config.ensure_output_dir()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Load images
-    phisat_img, phisat_ds = load_satellite_image(str(config.phisat_image_path))
-
-    sentinel_path = find_sentinel_band(str(config.sentinel_dir_path),
-                                       config.sentinel_band)
-    if not sentinel_path:
-        raise FileNotFoundError(
-            f"Sentinel band '{config.sentinel_band}' not found "
-            f"in {config.sentinel_dir_path}")
-    sentinel_img, sentinel_ds = load_satellite_image(sentinel_path)
+    phisat_img, phisat_ds = load_satellite_image(str(phisat_tiff))
+    sentinel_img, sentinel_ds = load_satellite_image(str(sentinel_tiff))
 
     # Save native (non-reprojected) PhiSat debug image for geometry sanity checks
     cv2.imwrite(
-        str(config.output_dir / "debug_phisat_native.jpg"),
+        str(output_dir / "debug_phisat_native.jpg"),
         cv2.cvtColor(phisat_img, cv2.COLOR_RGB2BGR),
     )
 
@@ -358,13 +353,13 @@ def run_matching(config: SceneConfig,
     phisat_aligned, sentinel_aligned, phi_tf, sen_tf, common_crs, phisat_effective_transform = create_independent_scaled_grids(
         phisat_img, phisat_ds,
         sentinel_img, sentinel_ds,
-        margin_pixels=config.margin_pixels
+        margin_pixels=margin_pixels
     )
 
     # Save raw reprojected debug images
-    cv2.imwrite(str(config.debug_phisat_path),
+    cv2.imwrite(str(output_dir / "debug_phisat.jpg"),
                 cv2.cvtColor(phisat_aligned, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(str(config.debug_sentinel_path),
+    cv2.imwrite(str(output_dir / "debug_sentinel.jpg"),
                 cv2.cvtColor(sentinel_aligned, cv2.COLOR_RGB2BGR))
 
     # 3. Enhance for matching
@@ -373,16 +368,16 @@ def run_matching(config: SceneConfig,
     sen_enh = enhance_for_matching(sentinel_aligned)
 
     # Save enhanced debug variants
-    cv2.imwrite(str(config.output_dir / "debug_phisat_enh.jpg"),
+    cv2.imwrite(str(output_dir / "debug_phisat_enh.jpg"),
                 cv2.cvtColor(phi_enh, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(str(config.output_dir / "debug_sentinel_enh.jpg"),
+    cv2.imwrite(str(output_dir / "debug_sentinel_enh.jpg"),
                 cv2.cvtColor(sen_enh, cv2.COLOR_RGB2BGR))
-    logger.info("  Debug images → %s", config.output_dir)
+    logger.info("  Debug images → %s", output_dir)
 
     # 4. Match (using a sliding window over the massive Sentinel image)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     matcher = get_matcher(matcher_name, device=device,
-                          max_keypoints=config.max_keypoints)
+                          max_keypoints=max_keypoints)
     
     phi_h, phi_w = phi_enh.shape[:2]
     sen_h, sen_w = sen_enh.shape[:2]
@@ -453,7 +448,7 @@ def run_matching(config: SceneConfig,
         return []
 
     # 6. Visualise matches  (include matcher name in filename)
-    viz_path = config.output_dir / f"matches_{matcher_name}.png"
+    viz_path = output_dir / f"matches_{matcher_name}.png"
     visualize_matches(phi_enh, sen_enh, kp0, kp1, str(viz_path))
 
     # 7. Geo-coordinates
@@ -480,9 +475,8 @@ def run_matching(config: SceneConfig,
         })
 
     # 8. Save
-    if config.tie_points_csv:
-        save_tie_points(tie_points, str(config.tie_points_path))
-        logger.info("Saved %d tie points → %s", len(tie_points), config.tie_points_path)
+    save_tie_points(tie_points, str(tie_points_path))
+    logger.info("Saved %d tie points → %s", len(tie_points), tie_points_path)
 
     phisat_ds.close()
     sentinel_ds.close()
