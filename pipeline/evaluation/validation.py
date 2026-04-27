@@ -52,7 +52,7 @@ def extract_patch(ortho_path: Path, cb, chip_crs, res=PIXEL_SIZE, margin=200.0, 
             
     return patch if np.count_nonzero(patch) > 0.3 * patch.size else None
 
-def verify_ncc(ortho_path: Path, gcp_json_path: Path, gcp_chip_dir: Path, output_path: Path, min_ncc: float = 0.4, **kwargs) -> dict:
+def validate_accuracy(ortho_path: Path, gcp_json_path: Path, gcp_chip_dir: Path, output_path: Path, min_ncc: float = 0.4, **kwargs) -> dict:
     with rasterio.open(str(ortho_path)) as src:
         ortho_bounds, ortho_crs = src.bounds, src.crs
 
@@ -68,6 +68,10 @@ def verify_ncc(ortho_path: Path, gcp_json_path: Path, gcp_chip_dir: Path, output
                     gi = g["GCP_Info"]
                     gcps.append({"id": g["ID"], "lon": float(gi["Longitude"]), "lat": float(gi["Latitude"]), "chip_path": chip_p})
                     seen_ids.add(g["ID"])
+
+    if not gcps:
+        logger.warning(f"No GCP chips found for {ortho_path.name}. Check sentinel_gri folder.")
+        return {"ncc": {"stats": {"total": {"rmse": None, "ce90": None, "n": 0}}, "results": []}}
 
     results = []
     for g in gcps:
@@ -99,7 +103,8 @@ def verify_ncc(ortho_path: Path, gcp_json_path: Path, gcp_chip_dir: Path, output
         cutoff = med + 3.0 * (1.4826 * mad) if mad > 0 else med + 10.0
         results = [r for r in results if r["total_m"] <= cutoff]
 
-    if not results: return {}
+    if not results: 
+        return {"ncc": {"stats": {"total": {"rmse": None, "ce90": None, "n": 0}}, "results": []}}
     totals = np.array([r["total_m"] for r in results])
     stats = {"n": len(results), "rmse": np.sqrt(np.mean(totals**2)), "rmse_px": np.sqrt(np.mean(totals**2))/PIXEL_SIZE,
              "ce90": np.percentile(totals, 90), "ce90_px": np.percentile(totals, 90)/PIXEL_SIZE,"mean": np.mean(totals)}
@@ -111,5 +116,5 @@ def verify_ncc(ortho_path: Path, gcp_json_path: Path, gcp_chip_dir: Path, output
     logger.info(f"Verified {stats['n']} GCPs. RMSE: {stats['rmse']:.2f} m")
     return {"ncc": {"stats": {"total": stats}, "results": results}}
 
-def run_verify(ortho_path, gcp_json_path, gcp_chip_dir, output_path, min_ncc=0.4, **kwargs):
-    return verify_ncc(ortho_path, gcp_json_path, gcp_chip_dir, output_path, min_ncc=min_ncc)
+def run_validation(ortho_path, gcp_json_path, gcp_chip_dir, output_path, min_ncc=0.4, **kwargs):
+    return validate_accuracy(ortho_path, gcp_json_path, gcp_chip_dir, output_path, min_ncc=min_ncc)

@@ -1,7 +1,6 @@
 import logging
 import os
 import numpy as np
-import shutil
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
