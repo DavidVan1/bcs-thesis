@@ -102,7 +102,7 @@ def verify_ncc(ortho_path: Path, gcp_json_path: Path, gcp_chip_dir: Path, output
     if not results: return {}
     totals = np.array([r["total_m"] for r in results])
     stats = {"n": len(results), "rmse": np.sqrt(np.mean(totals**2)), "rmse_px": np.sqrt(np.mean(totals**2))/PIXEL_SIZE,
-             "ce90": np.percentile(totals, 90), "mean": np.mean(totals)}
+             "ce90": np.percentile(totals, 90), "ce90_px": np.percentile(totals, 90)/PIXEL_SIZE,"mean": np.mean(totals)}
     
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
