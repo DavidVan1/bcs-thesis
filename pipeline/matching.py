@@ -20,8 +20,8 @@ from rasterio.warp import reproject, Resampling, transform_bounds
 from pyproj import Transformer, CRS
 import torch
 
-from .matchers import get_matcher
-from .utils import (
+from matchers import get_matcher
+from utils import (
     enhance_for_matching,
     load_satellite_image,
     save_tie_points,

@@ -7,8 +7,8 @@ from typing import Optional
 import numpy as np
 import rasterio
 
-from pipeline.sensor_model import RobustModel, create_model
-from pipeline.utils import load_calibration
+from sensor_model import RobustModel, create_model
+from utils import load_calibration
 
 
 def _rpc_terms(lon_n: np.ndarray, lat_n: np.ndarray, h_n: np.ndarray) -> np.ndarray:

@@ -16,8 +16,8 @@ import rasterio
 from pyproj import Transformer
 from scipy.optimize import least_squares
 
-from .sensor_model import RobustModel, create_model
-from .utils import load_tie_points, save_calibration
+from sensor_model import RobustModel, create_model
+from utils import load_tie_points, save_calibration
 
 logger = logging.getLogger(__name__)
 

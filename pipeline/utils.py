@@ -13,7 +13,7 @@ import numpy as np
 import cv2
 import rasterio
 
-from .config import DEFAULT_FOCAL_LENGTH, PROJECT_ROOT
+from config import DEFAULT_FOCAL_LENGTH, PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 

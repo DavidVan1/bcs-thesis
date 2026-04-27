@@ -374,7 +374,7 @@ def create_model(
     """Instantiate a sensor model from plain paths, load AOCS + timing."""
 
     try:
-        from .utils import load_metadata_timing
+        from utils import load_metadata_timing
     except ImportError:
         logger.warning("Failed to import load_metadata_timing. Timing will rely purely on AOCS.")
         load_metadata_timing = None
