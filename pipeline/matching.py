@@ -20,8 +20,8 @@ from rasterio.warp import reproject, Resampling, transform_bounds
 from pyproj import Transformer, CRS
 import torch
 
-from matchers import get_matcher
-from utils import (
+from pipeline.matchers import get_matcher
+from pipeline.utils import (
     enhance_for_matching,
     load_satellite_image,
     save_tie_points,
@@ -302,6 +302,7 @@ def run_matching(
     matcher_name: str = "lightglue",
     margin_pixels: int = 512,
     max_keypoints: int = 2048,
+    enhance_percentile: float = 98.0,
 ) -> List[Dict]:
     """
     Run the full matching pipeline for a scene:
@@ -364,7 +365,7 @@ def run_matching(
 
     # 3. Enhance for matching
     logger.info("Enhancing images...")
-    phi_enh = enhance_for_matching(phisat_aligned)
+    phi_enh = enhance_for_matching(phisat_aligned, 82)
     sen_enh = enhance_for_matching(sentinel_aligned)
 
     # Save enhanced debug variants
