@@ -4,6 +4,7 @@
 !/third_party/
 !/environment.yml
 !/evaluation/
+!/scripts/
 
 *.md
 scenes.json
