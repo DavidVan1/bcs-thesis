@@ -5,16 +5,79 @@ Shared utilities: image I/O, enhancement, tie-point loading.
 import csv
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 
 import numpy as np
 import cv2
 import rasterio
 
-from .config import DEFAULT_FOCAL_LENGTH, DEFAULT_PRINCIPAL_POINT
+from .config import DEFAULT_FOCAL_LENGTH, PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
+
+
+def configure_pipeline_file_logger(log_path: Optional[Path] = None) -> logging.Logger:
+    """Configure and return a dedicated logger writing compact stage lines to pipeline.log."""
+    ts = datetime.now().strftime("%Y%m%d")
+    target = log_path or (PROJECT_ROOT / f"logs/pipeline_{ts}.log")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    pipeline_logger = logging.getLogger("phisat_pipeline")
+    pipeline_logger.setLevel(logging.INFO)
+    pipeline_logger.propagate = False
+
+    target_resolved = target.resolve()
+    for handler in pipeline_logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            existing = Path(getattr(handler, "baseFilename", "")).resolve()
+            if existing == target_resolved:
+                return pipeline_logger
+
+    file_handler = logging.FileHandler(target, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    pipeline_logger.addHandler(file_handler)
+    return pipeline_logger
+
+
+def log_pipeline_stage(
+    *,
+    scene: str,
+    matcher: str,
+    stage: str,
+    status: str,
+    metrics: Optional[Dict[str, Any]] = None,
+    reason: Optional[str] = None,
+) -> None:
+    """Write a single structured line for a stage outcome to phisat_pipeline logger."""
+    line_parts = [
+        f"scene={scene}",
+        f"matcher={matcher}",
+        f"stage={stage}",
+        f"status={status}",
+    ]
+
+    if metrics:
+        for key, value in metrics.items():
+            if value is None:
+                continue
+            if isinstance(value, float):
+                line_parts.append(f"{key}={value:.3f}")
+            else:
+                line_parts.append(f"{key}={value}")
+
+    if reason:
+        safe_reason = "_".join(str(reason).strip().split())[:240]
+        line_parts.append(f"reason={safe_reason}")
+
+    configure_pipeline_file_logger().info(" ".join(line_parts))
 
 
 # ── Tie-point I/O ───────────────────────────────────────────────────────
@@ -58,12 +121,11 @@ def save_tie_points(tie_points: List[Dict], csv_path: str,
             writer.writerow({k: tp[k] for k in fields if k in tp})
 
 
-# ── Calibration JSON I/O ────────────────────────────────────────────────
 
 def load_calibration(json_path: str) -> Dict:
     """
-    Load calibration JSON and return a flat dict with keys:
-        f, cx, cy, k1, k2, roll, pitch, yaw, time_shift, cx_rate
+    Load calibration JSON and return a flat dict of runtime parameters
+    used by the RPC fitting pipeline.
     """
     with open(json_path) as f:
         data = json.load(f)
@@ -71,22 +133,24 @@ def load_calibration(json_path: str) -> Dict:
     cam = data.get("camera", {})
     pose = data.get("pose", {})
 
-    return {
+    out = {
         "f": cam.get("f", DEFAULT_FOCAL_LENGTH),
-        "cx": cam.get("cx", DEFAULT_PRINCIPAL_POINT),
-        "cy": cam.get("cy", DEFAULT_PRINCIPAL_POINT),
         "k1": cam.get("k1", 0.0),
         "k2": cam.get("k2", 0.0),
+        "f_scale": cam.get("f_scale", 1.0),
+        "cx_bias": cam.get("cx_bias", 0.0),
+        "cy_bias": cam.get("cy_bias", 0.0),
         "cx_rate": cam.get("cx_rate", 0.0),
-        "roll": pose.get("roll", 0.0),
-        "pitch": pose.get("pitch", 0.0),
-        "yaw": pose.get("yaw", 0.0),
+        "boresight_roll": pose.get("boresight_roll", pose.get("roll", 0.0)),
+        "boresight_pitch": pose.get("boresight_pitch", pose.get("pitch", 0.0)),
+        "boresight_yaw": pose.get("boresight_yaw", pose.get("yaw", 0.0)),
         "time_shift": pose.get("time_shift", 0.0),
         "along_rate": pose.get("along_rate", 0.0),
-        "roll_rate":  pose.get("roll_rate",  0.0),
-        "pitch_rate": pose.get("pitch_rate", 0.0),
-        "yaw_rate":   pose.get("yaw_rate",   0.0),
+        "drift_roll_1": pose.get("drift_roll_1", pose.get("roll_rate", 0.0)),
+        "drift_pitch_1": pose.get("drift_pitch_1", pose.get("pitch_rate", 0.0)),
+        "drift_yaw_1": pose.get("drift_yaw_1", pose.get("yaw_rate", 0.0)),
     }
+    return out
 
 
 def save_calibration(calib: Dict, json_path: str,
@@ -95,26 +159,33 @@ def save_calibration(calib: Dict, json_path: str,
     path = Path(json_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    output = {
-        "camera": {
-            "f": calib["f"],
-            "cx": calib["cx"],
-            "cy": calib["cy"],
-            "k1": calib.get("k1", 0.0),
-            "k2": calib.get("k2", 0.0),
-            "cx_rate": calib.get("cx_rate", 0.0),
-        },
-        "pose": {
-            "time_shift": calib.get("time_shift", 0.0),
-            "roll": calib.get("roll", 0.0),
-            "pitch": calib.get("pitch", 0.0),
-            "yaw": calib.get("yaw", 0.0),
-            "along_rate": calib.get("along_rate", 0.0),
-            "roll_rate":  calib.get("roll_rate",  0.0),
-            "pitch_rate": calib.get("pitch_rate", 0.0),
-            "yaw_rate":   calib.get("yaw_rate",   0.0),
-        },
+    camera = {
+        "f": calib["f"],
+        "cx": calib["cx"],
+        "cy": calib["cy"],
     }
+    for key in ["f_scale", "cx_bias", "cy_bias", "k1", "k2", "cx_rate"]:
+        if key in calib:
+            camera[key] = calib[key]
+
+    pose = {}
+    for key in [
+        "time_shift",
+        "roll", "pitch", "yaw",
+        "boresight_roll", "boresight_pitch", "boresight_yaw",
+        "along_rate",
+        "roll_rate", "pitch_rate", "yaw_rate",
+        "drift_roll_1", "drift_pitch_1", "drift_yaw_1",
+    ]:
+        if key in calib:
+            pose[key] = calib[key]
+
+    output = {
+        "camera": camera,
+        "pose": pose,
+    }
+    if "model_v2" in calib:
+        output["model_v2"] = calib["model_v2"]
     if stats:
         output["stats"] = stats
 
@@ -124,7 +195,7 @@ def save_calibration(calib: Dict, json_path: str,
 
 # ── Image helpers ────────────────────────────────────────────────────────
 
-def robust_histogram_stretch(img: np.ndarray) -> np.ndarray:
+def robust_histogram_stretch(img: np.ndarray, high_percentile=98) -> np.ndarray:
     """Percentile stretch (2–98 %) per channel."""
     out = np.zeros_like(img, dtype=np.uint8)
     channels = range(img.shape[-1]) if img.ndim == 3 else [None]
@@ -134,7 +205,7 @@ def robust_histogram_stretch(img: np.ndarray) -> np.ndarray:
         valid = c[c > 0] if c.min() >= 0 else c.ravel()
         if len(valid) == 0:
             continue
-        lo, hi = np.percentile(valid, (2, 98))
+        lo, hi = np.percentile(valid, (3, high_percentile))
         if hi <= lo:
             stretched = c.astype(np.uint8)
         else:
@@ -161,9 +232,9 @@ def clahe_enhance(image: np.ndarray,
     return cl.apply(image)
 
 
-def enhance_for_matching(img: np.ndarray) -> np.ndarray:
+def enhance_for_matching(img: np.ndarray, high_percentile=98) -> np.ndarray:
     """Full preprocessing chain for feature matching."""
-    return clahe_enhance(robust_histogram_stretch(img))
+    return clahe_enhance(robust_histogram_stretch(img, high_percentile))
 
 
 # ── Satellite image loading ──────────────────────────────────────────────
