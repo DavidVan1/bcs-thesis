@@ -202,10 +202,7 @@ def worker_task(scene_dir: Path, matcher: str, output_dir: Path, selected_stages
     wall_start = time.perf_counter()
     cpu_start = time.process_time()
 
-    gpu_id = None
-    if gpu_queue is not None:
-        gpu_id = gpu_queue.get()
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    gpu_id = gpu_queue.get() if gpu_queue else None
     
     logging.getLogger().setLevel(logging.ERROR)
     
@@ -298,13 +295,26 @@ def main() -> None:
     selected_stages, stage_label = _parse_stages(args.stage)
 
     needs_gpu = "match" in selected_stages or "all" in selected_stages
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
     if needs_gpu:
-        gpu_ids = [0] 
         manager = multiprocessing.Manager()
         gpu_queue = manager.Queue()
+
+        gpu_ids = [0]
+        
+        # GPU 0 has 13.8GB free -> 2 slots is safe
+        # for _ in range(2): 
+        #     gpu_queue.put(0)
+            
+        # GPU 1 only has 6.6GB free -> 1 slot ONLY
+        # Adding a second slot here will cause an OOM crash.
         for gpu_id in gpu_ids:
-            for _ in range(1): gpu_queue.put(gpu_id)
+            for _ in range(args.workers): 
+                gpu_queue.put(gpu_id)
+        
         max_workers = gpu_queue.qsize()
+        print(f"[INFO] Launching {max_workers} workers (on GPU(s)): {gpu_ids}")
     else:
         gpu_queue = None
         max_workers = args.workers if args.workers > 12 else 24
