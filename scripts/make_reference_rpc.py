@@ -303,12 +303,6 @@ def main() -> None:
 
         gpu_ids = [0]
         
-        # GPU 0 has 13.8GB free -> 2 slots is safe
-        # for _ in range(2): 
-        #     gpu_queue.put(0)
-            
-        # GPU 1 only has 6.6GB free -> 1 slot ONLY
-        # Adding a second slot here will cause an OOM crash.
         for gpu_id in gpu_ids:
             for _ in range(args.workers): 
                 gpu_queue.put(gpu_id)
