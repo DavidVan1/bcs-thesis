@@ -6,7 +6,6 @@ Handles CRS reprojection, image enhancement, feature matching
 and geo-coordinate extraction from the matched keypoints.
 """
 
-import csv
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -18,7 +17,6 @@ from rasterio.transform import from_origin
 from rasterio import Affine
 from rasterio.warp import reproject, Resampling, transform_bounds
 from pyproj import Transformer, CRS
-from rasterio.warp import calculate_default_transform
 import torch
 
 from pipeline.matchers import get_matcher
