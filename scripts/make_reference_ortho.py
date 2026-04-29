@@ -34,6 +34,7 @@ def worker_task(
     print(f"[ RUN  ] {scene_name}", flush=True)
     
     try:
+        pixel_size_m = 4.75
         # 1. Directory & Path Setup
         out_dir = output_root / scene_name
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -94,6 +95,9 @@ def worker_task(
         ce90 = stats.get("ce90")
         n_gcp = stats.get("n", 0)
 
+        rmse_px = (rmse / pixel_size_m) if rmse is not None else None
+        ce90_px = (ce90 / pixel_size_m) if ce90 is not None else None
+
         if n_gcp == 0 or rmse is None:
             print(f"[ SKIP ] {scene_name} - No valid GCP matches found.", flush=True)
             log_pipeline_stage(
@@ -123,7 +127,9 @@ def worker_task(
 
         return {
             "scene": scene_name, "status": "ok", 
-            "rmse": rmse, "ce90": ce90, "error": ""
+            "rmse": rmse, "ce90": ce90,
+            "rmse_px": rmse_px, "ce90_px": ce90_px,
+            "error": ""
         }
 
     except Exception as e:
@@ -136,32 +142,29 @@ def worker_task(
             status="FAIL", 
             reason=str(e)
         )
-        return {"scene": scene_name, "status": "fail", "error": str(e)}
+        return {
+            "scene": scene_name, "status": "fail",
+            "rmse": None, "ce90": None,
+            "rmse_px": None, "ce90_px": None,
+            "error": str(e)
+        }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Parallel Orthorectification and Verification Pipeline."
     )
-    # Core Paths
     parser.add_argument("--dataset", default="data/scenes", help="Input scenes directory")
     parser.add_argument("--output-root", default="data/02_reference", help="Root for orthos and metrics")
     parser.add_argument("--rpc-dir", default=None, help="Dir with _RPC.txt (defaults to data/reference_rpc/<matcher>)")
-    
-    # Matching Context
     parser.add_argument("--matcher", default="lightglue", help="Matcher tag used for filenames")
     parser.add_argument("--scene", default=None, help="Optional: process a single scene by name or path")
-    
-    # New Arguments Requested
     parser.add_argument("--min-ncc", type=float, default=0.4, help="NCC correlation threshold for verification")
     parser.add_argument("--overwrite-ortho", action="store_true", help="Force re-generation of existing ortho TIFFs")
-    
-    # System Execution
     parser.add_argument("--workers", type=int, default=10, help="Number of concurrent worker processes")
     
     args = parser.parse_args()
 
-    # 1. Setup Environment
     configure_pipeline_file_logger()
     dataset_dir = Path(args.dataset)
     output_root = Path(args.output_root)
@@ -212,7 +215,7 @@ def main() -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(report_path, "w", newline="") as f:
-        fieldnames = ["scene", "status", "rmse", "ce90", "error"]
+        fieldnames = ["scene", "status", "rmse", "ce90", "rmse_px", "ce90_px", "error"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(summary_rows)
