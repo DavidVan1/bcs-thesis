@@ -557,36 +557,3 @@ def run_fetch(scene_dir: Path, *,
     logger.info("=" * 60)
     logger.info("FETCH COMPLETE")
     logger.info("=" * 60)
-
-
-def _find_phisat_image(scene_dir: Path) -> Tuple[Optional[Path], Optional[Path]]:
-    """
-    Auto-detect the PhiSat-2 RGB band file and session metadata JSON
-    inside the PhiSat folder.
-
-    Priority order:
-      1. Any file whose name contains 'RGB'
-      2. The file whose name ends in '_12_<n>.tiff' with the highest n
-         (multi-band stacked image is typically numbered last)
-      3. First .tiff/.tif found
-    """
-    bands_dir = scene_dir / "bands"
-    chosen: Optional[Path] = None
-    if bands_dir.exists():
-        candidates = sorted(bands_dir.glob("*.tiff")) + sorted(bands_dir.glob("*.tif"))
-
-        # Priority 1: file containing 'RGB' in its name
-        rgb_matches = [c for c in candidates if "RGB" in c.name]
-        if rgb_matches:
-            chosen = rgb_matches[0]
-        elif candidates:
-            chosen = candidates[0]
-        else:
-            chosen = None
-
-    metadata_path = None
-    for p in scene_dir.glob("session_*.json"):
-        metadata_path = p
-        break
-
-    return chosen, metadata_path
