@@ -8,8 +8,10 @@
 !/scripts/
 !evaluate_external_rpc.py
 !make_rpc_template.py
+!dataset.csv
 
 *.md
+!README.md
 scenes.json
 
 __pycache__/
