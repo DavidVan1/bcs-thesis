@@ -3,6 +3,7 @@
 !/pipeline/
 !/third_party/
 !/environment.yml
+!environment_eval.yml
 !/evaluation/
 !/scripts/
 !evaluate_external_rpc.py
