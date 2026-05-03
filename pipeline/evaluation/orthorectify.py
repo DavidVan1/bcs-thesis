@@ -1,5 +1,4 @@
 import logging
-import os
 import numpy as np
 import subprocess
 import tempfile
@@ -14,33 +13,6 @@ logger = logging.getLogger(__name__)
 # ── Constants ────────────────────────────────────────────────────────────
 TARGET_GSD_M: float = 4.75
 
-def _gdal_subprocess_env() -> dict:
-    """
-    Returns the environment for GDAL subprocesses with explicit 
-    paths to PROJ/GDAL data to ensure projection support.
-    """
-    env = os.environ.copy()
-    candidates = []
-    conda_prefix = env.get("CONDA_PREFIX")
-    if conda_prefix:
-        candidates.append(Path(conda_prefix))
-    
-    # Specific fallback path for your environment
-    candidates.append(Path("/home/van6/miniconda3/envs/phisat"))
-
-    for prefix in candidates:
-        proj_dir = prefix / "share" / "proj"
-        if proj_dir.exists():
-            env.setdefault("PROJ_LIB", str(proj_dir))
-            env.setdefault("PROJ_DATA", str(proj_dir))
-            break
-
-    for prefix in candidates:
-        gdal_dir = prefix / "share" / "gdal"
-        if gdal_dir.exists():
-            env.setdefault("GDAL_DATA", str(gdal_dir))
-            break
-    return env
 
 def _utm_epsg_from_lonlat(lon: float, lat: float) -> int:
     """Returns the EPSG code for the UTM zone containing the given (lon, lat)."""
@@ -113,10 +85,9 @@ def _build_rpc_vrt(src_path: Path, vrt_path: Path, rpc_payload: dict) -> None:
     Creates a temporary VRT from the source TIFF and injects 
     the RPC metadata domain into the XML.
     """
-    gdal_env = _gdal_subprocess_env()
     subprocess.run(
         ["gdal_translate", "-of", "VRT", str(src_path), str(vrt_path)],
-        check=True, env=gdal_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
 
     tree = ET.parse(vrt_path)
@@ -158,7 +129,6 @@ def _gdal_rpc_orthorectify(
         lon, lat = center_x, center_y
 
     utm_epsg = _utm_epsg_from_lonlat(lon, lat)
-    gdal_env = _gdal_subprocess_env()
 
     with tempfile.TemporaryDirectory(prefix="rpc_ortho_") as tmp_dir:
         vrt_path = Path(tmp_dir) / "source_with_rpc.vrt"
@@ -175,7 +145,7 @@ def _gdal_rpc_orthorectify(
             str(vrt_path), str(out_path),
         ]
 
-        result = subprocess.run(cmd, env=gdal_env, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             logger.warning("GDAL Error: %s", result.stderr)
             return None
