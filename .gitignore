@@ -5,6 +5,8 @@
 !/environment.yml
 !/evaluation/
 !/scripts/
+!evaluate_external_rpc.py
+!make_rpc_template.py
 
 *.md
 scenes.json
