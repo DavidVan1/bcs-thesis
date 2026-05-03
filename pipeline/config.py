@@ -5,10 +5,7 @@ Each scene is a dataclass holding all file paths needed by every
 pipeline stage.  Add a new scene by editing pipeline/scenes.json.
 """
 
-import json
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, List
 
 
 # ── Project root (one level above pipeline/) ────────────────────────────
