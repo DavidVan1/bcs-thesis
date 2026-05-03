@@ -7,13 +7,6 @@ Given only the phisat folder (AOCS.json + GL_scene_0.json), downloads:
   2. Copernicus DEM GLO-30    – Google Earth Engine (COPERNICUS/DEM/GLO30)
   3. Copernicus GCP database  – ESA S2 GRI HTTPS tiles
 
-Usage (CLI):
-    python -m pipeline.run <scene> fetch
-    python -m pipeline.run new_scene fetch --phisat-dir phisat/phisat_new
-
-Usage (API):
-    from pipeline.fetch import run_fetch
-    run_fetch(scene_dir)
 
 Google Earth Engine authentication:
     Run once before first use:
@@ -22,23 +15,21 @@ Google Earth Engine authentication:
         python -c "import ee; ee.Authenticate()"
 """
 from __future__ import annotations
+import tarfile
 import warnings
+
+import requests
 warnings.filterwarnings("ignore", message="Couldn't find STAC entry", category=RuntimeWarning)
 
 
 import json
 import logging
 import os
-import re
 import shutil
-import tempfile
-import urllib.request
-import zipfile
 from pathlib import Path
 from typing import Optional, Tuple
-
-import numpy as np
-import math
+import boto3
+import urllib.parse
 
 logger = logging.getLogger(__name__)
 import geedim
@@ -178,7 +169,6 @@ def _make_tci(image):
              .toByte()
              .rename(["R", "G", "B"])
     )
-    # Cast back to ee.Image (copyProperties returns ee.Element)
     return ee.Image(tci)
 
 
@@ -332,23 +322,6 @@ def download_sentinel(
     gd_img = BaseImage(tci_image)
 
     logger.info("  Downloading TCI to %s ...", out_tif)
-    # if clip_to_region:
-    #     logger.info("  Export mode         : clipped to AOI+buffer")
-    #     prep_img = tci_image.gd.prepareForExport(
-    #         region=region,
-    #         scale=scale_m,
-    #         crs=native_crs,
-    #         dtype="uint8"
-    #     )
-    #     prep_img.gd.toGeoTIFF(str(out_tif), overwrite=True)
-    # else:
-    #     logger.info("  Export mode         : full Sentinel scene (no clipping)")
-    #     prep_img = tci_image.gd.prepareForExport(
-    #         scale=scale_m,
-    #         crs=native_crs,
-    #         dtype="uint8"
-    #     )
-    #     prep_img.gd.toGeoTIFF(str(out_tif), overwrite=True)
     if clip_to_region:
         logger.info("  Export mode         : clipped to AOI+buffer")
         gd_img.download(
@@ -428,15 +401,6 @@ def download_dem(
         dtype="float32",
         overwrite=True,
     )
-    
-    
-    # prep_dem = dem.gd.prepareForExport(
-    #     region=region,
-    #     scale=scale_m,
-    #     crs="EPSG:4326",
-    #     dtype="float32"
-    # )
-    # prep_dem.gd.toGeoTIFF(str(output_path), overwrite=True)
 
     logger.info("  Saved: %s", output_path)
     return output_path
@@ -446,164 +410,69 @@ def download_dem(
 # GCP database download (ESA Sentinel-2 GRI)
 # ═══════════════════════════════════════════════════════════════════════════
 
-# S2 GRI base URL  (the official ESA/DLR Sentinel-2 Geometric Reference Image)
-_GRI_BASE_URL = (
-    "https://s2gri.copernicus.eu/gri-db/download/v3"
-)
+def download_gcps(lon_min: float, lat_min: float, lon_max: float, lat_max: float, gcp_dir: Path, extract_chips: bool = True):
+    
+    # 1. Get static S3 keys from environment
+    access_key = os.environ.get("CDSE_ACCESS_KEY")
+    secret_key = os.environ.get("CDSE_SECRET_KEY")
+    
+    if not access_key or not secret_key:
+        raise ValueError("Please set CDSE_ACCESS_KEY and CDSE_SECRET_KEY environment variables.")
 
-# Alternative public mirror (no authentication needed)
-_GRI_MIRROR = (
-    "https://eodata.copernicus.eu/browser/GRI/S2/GRI_DB/v3"
-)
+    out = Path(gcp_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    bbox = [lon_min, lat_min, lon_max, lat_max]
 
-
-def _deg1_tile_names(
-    lon_min: float, lat_min: float,
-    lon_max: float, lat_max: float,
-) -> list[str]:
-    """
-    Return 1°×1° GRI tile names (e.g. 'N37W123') covering the bbox.
-    Tiles are named by their south-west corner.
-    """
-    tiles = []
-    for lat in range(math.floor(lat_min), math.ceil(lat_max)):
-        for lon in range(math.floor(lon_min), math.ceil(lon_max)):
-            ns = "N" if lat >= 0 else "S"
-            ew = "E" if lon >= 0 else "W"
-            tiles.append(f"{ns}{abs(lat):02d}{ew}{abs(lon):03d}")
-    return tiles
-
-
-def _try_download_url(url: str, dest: Path) -> bool:
-    """Attempt to download url → dest. Returns True on success."""
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "pipeline/1.0"})
-        with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
-            shutil.copyfileobj(r, f)
-        return True
-    except Exception:
-        return False
-
-
-def _wasabi_gri_url(tile: str) -> str:
-    """
-    Build the public Wasabi S3 URL for a GRI tile tar.gz.
-
-    URL pattern:
-      https://s3.eu-central-2.wasabisys.com/s2-mpc/data/S2_GRI/GCP_L1C/
-          <NS><DD>/<TILE>_L1C.tar.gz
-    where <NS><DD> is the 2-char latitude prefix (e.g. N37, S03).
-
-    Each tar.gz contains:
-      <TILE>_L1C/<TILE>.json         — GCP database
-      <TILE>_L1C/L1C_chips/*.TIF    — reference chips
-    """
-    # Extract latitude prefix: first 3 chars of tile name, e.g. "N37" from "N37E013"
-    lat_prefix = tile[:3]
-    return (
-        f"https://s3.eu-central-2.wasabisys.com/s2-mpc/data/S2_GRI"
-        f"/GCP_L1C/{lat_prefix}/{tile}_L1C.tar.gz"
+    # 2. Setup S3 Client
+    s3 = boto3.client(
+        "s3", endpoint_url="https://eodata.dataspace.copernicus.eu",
+        aws_access_key_id=access_key, aws_secret_access_key=secret_key
     )
 
+    # 3. Search STAC
+    stac_response = requests.post(
+        "https://stac.dataspace.copernicus.eu/v1/search",
+        json={"collections": ["sentinel-2-gri-l1c-gcp"], "bbox": bbox, "limit": 500}
+    )
+    if not stac_response.ok:
+        print(f"[ERROR] STAC Search Failed!\n{stac_response.text}")
+        stac_response.raise_for_status()
+        
+    items = stac_response.json().get("features", [])
 
-def download_gcps(
-    lon_min: float, lat_min: float,
-    lon_max: float, lat_max: float,
-    gcp_dir: Path,
-    *,
-    include_chips: bool = True,
-) -> list[Path]:
-    """
-    Download Copernicus S2 GRI GCP database tiles (JSON + L1C chips)
-    for the footprint.
+    # 4. Download & Extract
+    for item in items:
+        s3_url = item.get("assets", {}).get("gcp", {}).get("href")
+        json_dest = out / f"{item['id']}.json"
 
-    GCP tiles are 1°×1° named by their south-west corner: e.g. N37E013.
-
-    Each tile is downloaded as a single tar.gz from the public Wasabi S3
-    bucket — no authentication required:
-      https://s3.eu-central-2.wasabisys.com/s2-mpc/data/S2_GRI/GCP_L1C/
-
-    The archive is extracted in-place; only the JSON and (optionally) the
-    chips are kept.
-
-    Parameters
-    ----------
-    gcp_dir : Path
-        Destination directory (e.g. gcp/my_scene/).
-    include_chips : bool
-        Also extract L1C reference chips (required for verify stage).
-
-    Returns
-    -------
-    List of downloaded JSON paths.
-    """
-    import tarfile
-    import tempfile
-
-    tiles = _deg1_tile_names(lon_min, lat_min, lon_max, lat_max)
-    logger.info("  GCP tiles needed: %s", tiles)
-
-    gcp_dir.mkdir(parents=True, exist_ok=True)
-    chip_dir = gcp_dir / "L1C_chips"
-    if include_chips:
-        chip_dir.mkdir(parents=True, exist_ok=True)
-
-    json_paths = []
-
-    for tile in tiles:
-        json_dest = gcp_dir / f"{tile}.json"
-
-        # Check if already fully downloaded
-        if json_dest.exists():
-            logger.info("  %s — already exists, skipping", tile)
-            json_paths.append(json_dest)
+        if not s3_url or json_dest.exists() or not s3_url.startswith("s3://"):
             continue
 
-        url = _wasabi_gri_url(tile)
-        logger.info("  Downloading %s from Wasabi S3 ...", tile)
-        logger.info("    %s", url)
-
-        # Stream tar.gz into a temp file, then extract
-        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-
+        bucket, key = urllib.parse.urlparse(s3_url).netloc, urllib.parse.urlparse(s3_url).path.lstrip("/")
+        tar_dest = out / Path(key).name
+        
+        print(f"Downloading {key}...")
         try:
-            if not _try_download_url(url, tmp_path):
-                logger.warning("    Could not download %s_L1C.tar.gz", tile)
-                logger.warning("    Manual download: %s", url)
-                tmp_path.unlink(missing_ok=True)
-                continue
+            response = s3.get_object(Bucket=bucket, Key=key)
+            with open(tar_dest, "wb") as f:
+                for chunk in response['Body'].iter_chunks(chunk_size=1024 * 1024):
+                    f.write(chunk)
+        except Exception as e:
+            print(f"[ERROR] Failed to download {key}: {e}")
+            continue
 
-            with tarfile.open(tmp_path, "r:gz") as tar:
-                # Archive layout: <TILE>_L1C/<TILE>.json
-                #                 <TILE>_L1C/L1C_chips/*.TIF
-                members_to_extract = []
-                for member in tar.getmembers():
-                    name = member.name
-                    if name.endswith(".json"):
-                        # Extract JSON flat into gcp_dir
-                        member.name = Path(name).name
-                        members_to_extract.append((member, gcp_dir))
-                    elif include_chips and "/L1C_chips/" in name and name.endswith(".TIF"):
-                        member.name = Path(name).name
-                        members_to_extract.append((member, chip_dir))
-
-                for member, dest_dir in members_to_extract:
-                    tar.extract(member, path=dest_dir)
-
-            if json_dest.exists():
-                n_chips = len(list(chip_dir.glob("*.TIF"))) if include_chips else 0
-                logger.info(
-                    "  %s.json extracted%s", tile,
-                    f"  ({n_chips} chips)" if include_chips else "")
-                json_paths.append(json_dest)
-            else:
-                logger.warning("  %s.json not found inside archive", tile)
-
-        finally:
-            tmp_path.unlink(missing_ok=True)
-
-    return json_paths
+        with tarfile.open(tar_dest, "r:gz") as tar:
+            for member in tar.getmembers():
+                if member.name.endswith(".json"):
+                    with tar.extractfile(member) as src, open(json_dest, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                elif extract_chips and "/L1C_chips/" in member.name and member.name.upper().endswith(".TIF"):
+                    chip_dest = out / "L1C_chips" / Path(member.name).name
+                    chip_dest.parent.mkdir(exist_ok=True)
+                    with tar.extractfile(member) as src, open(chip_dest, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                        
+        tar_dest.unlink()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -688,36 +557,3 @@ def run_fetch(scene_dir: Path, *,
     logger.info("=" * 60)
     logger.info("FETCH COMPLETE")
     logger.info("=" * 60)
-
-
-def _find_phisat_image(scene_dir: Path) -> Tuple[Optional[Path], Optional[Path]]:
-    """
-    Auto-detect the PhiSat-2 RGB band file and session metadata JSON
-    inside the PhiSat folder.
-
-    Priority order:
-      1. Any file whose name contains 'RGB'
-      2. The file whose name ends in '_12_<n>.tiff' with the highest n
-         (multi-band stacked image is typically numbered last)
-      3. First .tiff/.tif found
-    """
-    bands_dir = scene_dir / "bands"
-    chosen: Optional[Path] = None
-    if bands_dir.exists():
-        candidates = sorted(bands_dir.glob("*.tiff")) + sorted(bands_dir.glob("*.tif"))
-
-        # Priority 1: file containing 'RGB' in its name
-        rgb_matches = [c for c in candidates if "RGB" in c.name]
-        if rgb_matches:
-            chosen = rgb_matches[0]
-        elif candidates:
-            chosen = candidates[0]
-        else:
-            chosen = None
-
-    metadata_path = None
-    for p in scene_dir.glob("session_*.json"):
-        metadata_path = p
-        break
-
-    return chosen, metadata_path

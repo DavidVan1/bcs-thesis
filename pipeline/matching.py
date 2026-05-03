@@ -6,7 +6,6 @@ Handles CRS reprojection, image enhancement, feature matching
 and geo-coordinate extraction from the matched keypoints.
 """
 
-import csv
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -20,8 +19,8 @@ from rasterio.warp import reproject, Resampling, transform_bounds
 from pyproj import Transformer, CRS
 import torch
 
-from .matchers import get_matcher
-from .utils import (
+from pipeline.matchers import get_matcher
+from pipeline.utils import (
     enhance_for_matching,
     load_satellite_image,
     save_tie_points,
@@ -52,34 +51,71 @@ def _determine_common_crs(phisat_ds: rasterio.DatasetReader, sentinel_ds: raster
 
 def _rectify_affine(transform: Affine) -> Affine:
     """
-    Remove shear and enforce square pixels + orthogonal axes.
-    Safely catches degenerate (un-invertible) matrices.
+    Corrects invalid or severely anisotropic affine transforms.
     """
-    # Extract vectors
     col_vec = np.array([transform.a, transform.d], dtype=float)
     row_vec = np.array([transform.b, transform.e], dtype=float)
 
-    # Compute pixel size (average of both directions)
+    # Compute magnitudes (pixel sizes)
     col_mag = float(np.linalg.norm(col_vec))
     row_mag = float(np.linalg.norm(row_vec))
 
-    # If the matrix is degenerate (scale is 0), we cannot return it.
-    # We must apply a safe 4.7m pseudo-transform to prevent the crash.
-    if col_mag < 1e-12 or row_mag < 1e-12:
-        logger.warning("Degenerate geotransform (scale 0) detected! Applying 4.7m fallback.")
-        return Affine.translation(transform.c, transform.f) * Affine.scale(4.7, -4.7)
+    # 1. Total Degeneracy Check
+    if col_mag < 1e-12 and row_mag < 1e-12:
+        logger.warning("Degenerate geotransform (scale 0) detected! Applying 4.5m fallback.")
+        return Affine.translation(transform.c, transform.f) * Affine.scale(4.5, -4.5)
 
-    pixel_size = (col_mag + row_mag) / 2.0
+    # 2. Check Anisotropy & Partial Degeneracy
+    max_mag = max(col_mag, row_mag)
+    min_mag = min(col_mag, row_mag)
+    anisotropy = max_mag / max(min_mag, 1e-12)
 
-    # Normalize column direction
-    col_dir = col_vec / col_mag
+    if anisotropy <= 1.5 and min_mag >= 1e-12:
+        return transform
 
-    # Force orthogonal row direction
-    row_dir = np.array([-col_dir[1], col_dir[0]])
+    # 3. Rebuild (Transform is broken: highly anisotropic or one axis collapsed)
+    logger.info("Rectifying invalid transform (anisotropy %.2f). Rebuilding isotropically.", anisotropy)
 
-    # Rebuild clean transform
-    col_new = col_dir * pixel_size
-    row_new = row_dir * pixel_size
+    # Anchor to the "healthiest" axis (the one with the larger magnitude)
+    if col_mag >= row_mag:
+        base_vec = col_vec
+        pixel_size = col_mag
+        is_col_base = True
+    else:
+        base_vec = row_vec
+        pixel_size = row_mag
+        is_col_base = False
+
+    # Normalize the base direction
+    base_dir = base_vec / pixel_size
+
+    # Create a forced orthogonal direction to remove shear caused by the collapse
+    ortho_dir = np.array([-base_dir[1], base_dir[0]], dtype=float)
+
+    # Reconstruct column and row vectors using the healthy pixel size
+    if is_col_base:
+        col_new = base_dir * pixel_size
+        row_new = ortho_dir * pixel_size
+    else:
+        row_new = base_dir * pixel_size
+        col_new = ortho_dir * pixel_size
+
+    # 4. Preserve Handedness
+    cross_orig = col_vec[0] * row_vec[1] - col_vec[1] * row_vec[0]
+    cross_new = col_new[0] * row_new[1] - col_new[1] * row_new[0]
+
+    if abs(cross_orig) > 1e-24:
+        if cross_orig * cross_new < 0:
+            if is_col_base:
+                row_new = -row_new
+            else:
+                col_new = -col_new
+    else:
+        if cross_new > 0:
+            if is_col_base:
+                row_new = -row_new
+            else:
+                col_new = -col_new
 
     return Affine(
         col_new[0], row_new[0], transform.c,
@@ -211,6 +247,8 @@ def create_independent_scaled_grids(
 
     return phisat_aligned, sentinel_aligned, phi_common_transform, sen_common_transform, common_crs, phisat_src_transform
 
+
+
 # ── RANSAC filter ──────────────────────────────────────────────────────
 
 def ransac_filter(
@@ -302,6 +340,7 @@ def run_matching(
     matcher_name: str = "lightglue",
     margin_pixels: int = 512,
     max_keypoints: int = 2048,
+    enhance_percentile: float = 98.0,
 ) -> List[Dict]:
     """
     Run the full matching pipeline for a scene:

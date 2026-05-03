@@ -16,8 +16,8 @@ import rasterio
 from pyproj import Transformer
 from scipy.optimize import least_squares
 
-from .sensor_model import RobustModel, create_model
-from .utils import load_tie_points, save_calibration
+from pipeline.sensor_model import RobustModel, create_model
+from pipeline.utils import load_tie_points, save_calibration
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +171,7 @@ class CameraCalibrator:
         inliers = [tp for tp, d in zip(tie_points, distances) if d < threshold]
         return inliers, mean_err, threshold
 
-    def calibrate(self, tie_points: List[Dict], verbose: bool = True) -> Tuple[Dict, Dict, least_squares]:
+    def calibrate(self, tie_points: List[Dict], verbose: bool = False) -> Tuple[Dict, Dict, least_squares]:
         """Execute the full 3-phase calibration."""
         if len(tie_points) < 20:
             raise RuntimeError(f"Insufficient tie points for calibration: {len(tie_points)}")
@@ -249,7 +249,7 @@ def run_calibration(
     f: float = 105454.0,
     cx: float = 2048.0,
     cy: float = 2048.0,
-    verbose: bool = True,
+    verbose: bool = False,
 ) -> Dict:
     """
     Full 3-phase calibration for a scene.

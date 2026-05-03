@@ -217,9 +217,6 @@ def fit_rpc(
     line_num, line_den = _fit_rational_rpc_component(line_n, terms)
     samp_num, samp_den = _fit_rational_rpc_component(samp_n, terms)
 
-    # line_num, line_den = _fit_rational_rpc_component_ridge(line_n, terms, lam=1e-4)
-    # samp_num, samp_den = _fit_rational_rpc_component_ridge(samp_n, terms, lam=1e-4)
-
 
     rpc = {
         "LINE_OFF": line_off,

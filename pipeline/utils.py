@@ -13,15 +13,31 @@ import numpy as np
 import cv2
 import rasterio
 
-from .config import DEFAULT_FOCAL_LENGTH, PROJECT_ROOT
+try:
+    from .config import DEFAULT_FOCAL_LENGTH, DEFAULT_PRINCIPAL_POINT, PROJECT_ROOT
+except ImportError:
+    from config import DEFAULT_FOCAL_LENGTH, DEFAULT_PRINCIPAL_POINT, PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
 
-def configure_pipeline_file_logger(log_path: Optional[Path] = None) -> logging.Logger:
-    """Configure and return a dedicated logger writing compact stage lines to pipeline.log."""
-    ts = datetime.now().strftime("%Y%m%d")
-    target = log_path or (PROJECT_ROOT / f"logs/pipeline_{ts}.log")
+def configure_pipeline_file_logger(run_id: Optional[str] = None, log_path: Optional[Path] = None) -> logging.Logger:
+    """Configure and return a dedicated logger writing compact stage lines to a run-specific log file."""
+    
+    # Generate the log file name
+    if log_path:
+        target = log_path
+    else:
+        # If a run_id is provided, include it in the filename. 
+        # Otherwise, default to the date.
+        ts = datetime.now().strftime("%Y%m%d")
+        if run_id:
+            filename = f"pipeline_{run_id}.log"
+        else:
+            filename = f"pipeline_{ts}.log"
+            
+        target = PROJECT_ROOT / f"logs/{filename}"
+        
     target.parent.mkdir(parents=True, exist_ok=True)
 
     pipeline_logger = logging.getLogger("phisat_pipeline")
@@ -29,11 +45,17 @@ def configure_pipeline_file_logger(log_path: Optional[Path] = None) -> logging.L
     pipeline_logger.propagate = False
 
     target_resolved = target.resolve()
+    
+    # Check if we already have a handler pointing to this specific file
     for handler in pipeline_logger.handlers:
         if isinstance(handler, logging.FileHandler):
             existing = Path(getattr(handler, "baseFilename", "")).resolve()
             if existing == target_resolved:
                 return pipeline_logger
+
+    # If the filename changed (new run), or no handler exists, set up a new one
+    # First, clear old handlers to prevent writing to multiple files from previous runs in the same Python session
+    pipeline_logger.handlers.clear() 
 
     file_handler = logging.FileHandler(target, encoding="utf-8")
     file_handler.setLevel(logging.INFO)
@@ -77,7 +99,7 @@ def log_pipeline_stage(
         safe_reason = "_".join(str(reason).strip().split())[:240]
         line_parts.append(f"reason={safe_reason}")
 
-    configure_pipeline_file_logger().info(" ".join(line_parts))
+    logging.getLogger("phisat_pipeline").info(" ".join(line_parts))
 
 
 # ── Tie-point I/O ───────────────────────────────────────────────────────
@@ -135,6 +157,8 @@ def load_calibration(json_path: str) -> Dict:
 
     out = {
         "f": cam.get("f", DEFAULT_FOCAL_LENGTH),
+        "cx": cam.get("cx", DEFAULT_PRINCIPAL_POINT),
+        "cy": cam.get("cy", DEFAULT_PRINCIPAL_POINT),
         "k1": cam.get("k1", 0.0),
         "k2": cam.get("k2", 0.0),
         "f_scale": cam.get("f_scale", 1.0),
@@ -205,7 +229,7 @@ def robust_histogram_stretch(img: np.ndarray, high_percentile=98) -> np.ndarray:
         valid = c[c > 0] if c.min() >= 0 else c.ravel()
         if len(valid) == 0:
             continue
-        lo, hi = np.percentile(valid, (3, high_percentile))
+        lo, hi = np.percentile(valid, (2, high_percentile))
         if hi <= lo:
             stretched = c.astype(np.uint8)
         else:
