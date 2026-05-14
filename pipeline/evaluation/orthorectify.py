@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 TARGET_GSD = 4.75
 MAX_ORTHO_DIM = 25000
-MAX_AREA_RATIO = 8.0
+MAX_AREA_RATIO = 6.0
 
 def _get_clean_rpc_dict(txt_path: Path) -> dict:
     raw_rpc = {}
