@@ -119,7 +119,6 @@ class PhiSatPushbroomModel:
         self.row_max: Optional[float] = None
         self._row_range_warning_emitted = False
 
-    # ── Metadata Loading ────────────────────────────────────────────
 
     def load_aocs_metadata(self, json_path: str, acquisition_index: int = 0) -> None:
         path = Path(json_path)
@@ -143,7 +142,6 @@ class PhiSatPushbroomModel:
         self.row_max = float(row_max)
         logger.info("Using row range for normalized line time: [%.1f, %.1f]", self.row_min, self.row_max)
 
-    # ── Geometry Mathematics ────────────────────────────────────────
 
     @staticmethod
     def quaternion_to_rotation_matrix(q: np.ndarray) -> np.ndarray:

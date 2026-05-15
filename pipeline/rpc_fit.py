@@ -183,7 +183,7 @@ def fit_rpc(
         raise RuntimeError(f"Not enough valid samples for RPC fitting: {len(u)}")
 
 
-    # 5) Normalize to [-1, 1]
+    # Normalize to [-1, 1]
     line_off = 0.5 * (float(v.min()) + float(v.max()))
     samp_off = 0.5 * (float(u.min()) + float(u.max()))
     line_scale = max(0.5 * (float(v.max()) - float(v.min())), 1e-8)
@@ -205,7 +205,7 @@ def fit_rpc(
     h_n = (h - height_off) / height_scale
 
 
-    # 6) Standard 20-term RPC basis
+    # Standard 20-term RPC basis
     terms = _rpc_terms(lon_n, lat_n, h_n)
 
 
@@ -213,7 +213,7 @@ def fit_rpc(
     samp_n = (u - samp_off) / samp_scale
 
 
-    # 7-8) Least-squares estimation of full rational RPC coefficients
+    # Least-squares estimation of full rational RPC coefficients
     line_num, line_den = _fit_rational_rpc_component(line_n, terms)
     samp_num, samp_den = _fit_rational_rpc_component(samp_n, terms)
 

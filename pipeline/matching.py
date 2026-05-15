@@ -249,7 +249,6 @@ def create_independent_scaled_grids(
 
 
 
-# ── RANSAC filter ──────────────────────────────────────────────────────
 
 def ransac_filter(
     kp0: np.ndarray,
@@ -270,7 +269,6 @@ def ransac_filter(
     return kp0, kp1, confidence
 
 
-# ── Match visualizer ──────────────────────────────────────────────────
 
 def visualize_matches(image0: np.ndarray, image1: np.ndarray,
                      keypoints0: np.ndarray, keypoints1: np.ndarray,

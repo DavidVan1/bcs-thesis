@@ -268,7 +268,7 @@ def download_sentinel(
     import datetime
     best_image = None
 
-    # ── pass 1: around acquisition date ───────────────────────────
+    # pass 1: around acquisition date
     if acq_date:
         dt = datetime.datetime.strptime(acq_date, "%Y-%m-%d")
         td = datetime.timedelta(days=date_window_days)
@@ -277,17 +277,17 @@ def download_sentinel(
         logger.info("  Pass 1 — %s -> %s (cloud <= %.0f%%)", start, end, max_cloud_pct)
         best_image = _find_best_image(start, end, max_cloud_pct)
 
-    # ── pass 2: full archive ───────────────────────────────────────
+    # pass 2: full archive
     if best_image is None:
         logger.info("  Pass 2 — full archive (cloud <= %.0f%%)", max_cloud_pct)
         best_image = _find_best_image("2015-01-01", "2099-01-01", max_cloud_pct)
 
-    # ── pass 3: relaxed cloud ──────────────────────────────────────
+    # pass 3: relaxed cloud
     if best_image is None:
         logger.info("  Pass 3 — full archive, cloud <= 30%%")
         best_image = _find_best_image("2015-01-01", "2099-01-01", 30.0)
 
-    # ── pass 4: no cloud filter ────────────────────────────────────
+    # pass 4: no cloud filter
     if best_image is None:
         logger.info("  Pass 4 — full archive, no cloud filter (coverage >= %.0f%%)", min_coverage * 100)
         best_image = _find_best_image("2015-01-01", "2099-01-01", 100.0)
@@ -346,10 +346,6 @@ def download_sentinel(
     return out_tif
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DEM download via Google Earth Engine
-# ═══════════════════════════════════════════════════════════════════════════
-
 def download_dem(
     lon_min: float, lat_min: float,
     lon_max: float, lat_max: float,
@@ -405,10 +401,6 @@ def download_dem(
     logger.info("  Saved: %s", output_path)
     return output_path
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# GCP database download (ESA Sentinel-2 GRI)
-# ═══════════════════════════════════════════════════════════════════════════
 
 def download_gcps(lon_min: float, lat_min: float, lon_max: float, lat_max: float, gcp_dir: Path, extract_chips: bool = True):
     
@@ -475,10 +467,6 @@ def download_gcps(lon_min: float, lat_min: float, lon_max: float, lat_max: float
         tar_dest.unlink()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Public entry point
-# ═══════════════════════════════════════════════════════════════════════════
-
 def run_fetch(scene_dir: Path, *,
               no_gcp_chips: bool = False) -> None:
     """
@@ -488,9 +476,6 @@ def run_fetch(scene_dir: Path, *,
     All downloads are skipped if the files already exist.
     """
     scene_dir = Path(scene_dir)
-    logger.info("=" * 60)
-    logger.info("FETCH — automatic data download — scene '%s'", scene_dir.name)
-    logger.info("=" * 60)
 
     # ── 1. Derive footprint ────────────────────────────────────────
     phisat_dir = scene_dir
@@ -511,7 +496,6 @@ def run_fetch(scene_dir: Path, *,
     acq_date = _load_acquisition_time(phisat_dir)
     logger.info("  Acquisition date: %s", acq_date or 'unknown')
 
-    # ── 2. Sentinel-2 ──────────────────────────────────────────────
     try:
         sentinel_path = scene_dir / "sentinel.tif"
         s2_path = download_sentinel(
@@ -524,7 +508,6 @@ def run_fetch(scene_dir: Path, *,
         logger.error("  Sentinel-2 download failed: %s", e)
         logger.error("    You can download manually from https://dataspace.copernicus.eu/")
 
-    # ── 3. DEM ─────────────────────────────────────────────────────
     dem_path = scene_dir / "dem.tif"
 
     try:
@@ -537,7 +520,6 @@ def run_fetch(scene_dir: Path, *,
         logger.error("  DEM download failed: %s", e)
         logger.error("    You can download manually from https://opentopography.org/")
 
-    # ── 4. GCPs ────────────────────────────────────────────────────
     gcp_dir = scene_dir / "sentinel_gri"
     gcp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -553,7 +535,3 @@ def run_fetch(scene_dir: Path, *,
     except Exception as e:
         logger.error("  GCP download failed: %s", e)
         logger.error("    You can download manually from https://s2gri.copernicus.eu/")
-
-    logger.info("=" * 60)
-    logger.info("FETCH COMPLETE")
-    logger.info("=" * 60)

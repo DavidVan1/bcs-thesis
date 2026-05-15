@@ -261,7 +261,6 @@ def enhance_for_matching(img: np.ndarray, high_percentile=98) -> np.ndarray:
     return clahe_enhance(robust_histogram_stretch(img, high_percentile))
 
 
-# ── Satellite image loading ──────────────────────────────────────────────
 
 def load_satellite_image(path: str) -> Tuple[np.ndarray, rasterio.DatasetReader]:
     """
@@ -307,7 +306,6 @@ def find_sentinel_band(sentinel_dir: str,
     return str(tifs[0]) if tifs else None
 
 
-# ── Metadata helpers ─────────────────────────────────────────────────────
 
 def load_metadata_timing(metadata_path: str) -> Optional[Dict]:
     """

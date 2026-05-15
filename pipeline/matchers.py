@@ -1,23 +1,3 @@
-"""
-Pluggable feature-matcher wrappers.
-
-Each matcher takes two RGB uint8 images (H, W, 3) and returns
-``{"keypoints0": (N,2), "keypoints1": (N,2), "confidence": (N,)}``.
-Internally each class handles its own preprocessing (resize, grayscale
-conversion, tensor format) and rescales output keypoints back to the
-**original** image resolution so the caller never has to worry about it.
-
-Supported matchers
--------------------
-* ``lightglue``       – SuperPoint + LightGlue  (sparse)
-* ``efficientloftr``  – EfficientLoFTR           (dense)
-
-Use :func:`get_matcher` as the single entry point::
-
-    matcher = get_matcher("lightglue", device="cuda", max_keypoints=2000)
-    result  = matcher.match(phisat_rgb, sentinel_rgb)
-"""
-
 from __future__ import annotations
 
 import sys
@@ -44,7 +24,6 @@ def _ensure_path(*dirs: Path) -> None:
             sys.path.insert(0, s)
 
 
-# ── helpers ──────────────────────────────────────────────────────────────
 
 def _to_grayscale_tensor(img: np.ndarray, device: str) -> torch.Tensor:
     """RGB uint8 (H,W,3) → float32 [1,1,H,W] on *device*."""
@@ -119,10 +98,6 @@ def _empty() -> Dict[str, np.ndarray]:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Base class
-# ═══════════════════════════════════════════════════════════════════════════
-
 class BaseMatcher(ABC):
     """Interface every matcher must implement."""
 
@@ -147,10 +122,6 @@ class BaseMatcher(ABC):
         """
         ...
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# LightGlue  (sparse: SuperPoint + LightGlue)
-# ═══════════════════════════════════════════════════════════════════════════
 
 class LightGlueMatcher(BaseMatcher):
     name = "lightglue"
@@ -179,10 +150,6 @@ class LightGlueMatcher(BaseMatcher):
         return {"keypoints0": kp0, "keypoints1": kp1, "confidence": conf}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# EfficientLoFTR  (dense, grayscale)
-# ═══════════════════════════════════════════════════════════════════════════
-
 class EfficientLoFTRMatcher(BaseMatcher):
     """EfficientLoFTR — fast LoFTR variant with RepVGG backbone (grayscale, 832×832)."""
     name = "efficientloftr"
@@ -195,7 +162,7 @@ class EfficientLoFTRMatcher(BaseMatcher):
         _eloftr_root = _TP / "EfficientLoFTR"
         _ensure_path(str(_eloftr_root))
 
-        from src.config.default import get_cfg_defaults  # noqa
+        from src.config.default import get_cfg_defaults # noqa
         from src.utils.misc import lower_config  # noqa
         from src.loftr import LoFTR as ELoFTR  # noqa
         from src.loftr.loftr import reparameter  # noqa
@@ -249,10 +216,6 @@ class EfficientLoFTRMatcher(BaseMatcher):
                 "keypoints1": _rescale_keypoints(kp1, sc1),
                 "confidence": conf}
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Factory
-# ═══════════════════════════════════════════════════════════════════════════
 
 _REGISTRY: dict[str, type[BaseMatcher]] = {
     "lightglue":      LightGlueMatcher,

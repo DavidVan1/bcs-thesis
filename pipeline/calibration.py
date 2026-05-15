@@ -22,10 +22,6 @@ from pipeline.utils import load_tie_points, save_calibration
 logger = logging.getLogger(__name__)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Configuration
-# ═══════════════════════════════════════════════════════════════════════════
-
 @dataclass(frozen=True)
 class ParamSpec:
     """Single optimization parameter definition for camera model."""
@@ -64,10 +60,6 @@ class CalibrationConfig:
     drift_warning_threshold: float = 1.0  # degrees
     robust_loss_scale: float = 100.0
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Data Preparation
-# ═══════════════════════════════════════════════════════════════════════════
 
 class DataEnricher:
     """Handles spatial data preparation prior to calibration."""
@@ -109,10 +101,6 @@ class DataEnricher:
         logger.info("DEM enrichment: kept %d / %d tie points (dropped %d)", len(out_points), len(tie_points), dropped)
         return out_points
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Core Optimization Logic
-# ═══════════════════════════════════════════════════════════════════════════
 
 class CameraCalibrator:
     """Stateful handler for the 3-phase robust calibration process."""
@@ -178,27 +166,27 @@ class CameraCalibrator:
 
         opt_kwargs = {"bounds": self.bounds, "verbose": 2 if verbose else 0}
 
-        # ── Phase 1: Robust (Soft L1) ──
+        # Robust (Soft L1) optimization to mitigate outliers
         logger.info("\n--- Phase 1: Robust Optimisation (Soft L1) ---")
         res1 = least_squares(
             self._residuals, self.initial_guess, args=(tie_points,),
             loss="soft_l1", f_scale=self.config.robust_loss_scale, **opt_kwargs
         )
 
-        # ── Phase 2: Outlier Filtering ──
+        # Outlier Filtering 
         logger.info("\n--- Phase 2: Outlier Filtering (%.1f-σ) ---", self.config.outlier_sigma)
         inliers, mean_err, threshold = self._filter_outliers(res1.x, tie_points)
         logger.info("Mean Err: %.1f m | Threshold: %.1f m", mean_err, threshold)
         logger.info("Kept %d inliers. Removed %d outliers.", len(inliers), len(tie_points) - len(inliers))
 
-        # ── Phase 3: Final refinement ──
+        # Final refinement
         logger.info("\n--- Phase 3: Final Refinement ---")
         res_final = least_squares(
             self._residuals, res1.x, args=(inliers,),
             loss="linear", ftol=1e-6, **opt_kwargs
         )
 
-        # ── Evaluate Results ──
+        # Evaluate Results
         p_opt = self.unpack_params(res_final.x)
         final_rmse = np.sqrt(np.mean(res_final.fun ** 2))
         
@@ -236,10 +224,6 @@ class CameraCalibrator:
                 logger.warning("Parameter '%s' hit bound (%.6f). Model may be under-constrained.", self.param_names[i], val)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Pipeline Runner (Backward Compatible API)
-# ═══════════════════════════════════════════════════════════════════════════
-
 def run_calibration(
     aocs_path: Path,
     metadata_path: Optional[Path],
@@ -259,10 +243,6 @@ def run_calibration(
     missing = [p for p in (aocs_path, tie_points_path, dem_path) if not p.exists()]
     if missing:
         raise FileNotFoundError(f"Missing files for calibration: {', '.join(map(str, missing))}")
-
-    logger.info("=" * 60)
-    logger.info("CALIBRATION")
-    logger.info("=" * 60)
 
     # 2. Setup Model & Data
     model = create_model(aocs_path, metadata_path, f=f, cx=cx, cy=cy, model_class=RobustModel)
