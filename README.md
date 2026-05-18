@@ -27,6 +27,8 @@ The PhiSat-2 scenes and reference orthorectified images are hosted on Hugging Fa
 
 https://huggingface.co/datasets/davidvan1/phisat2-ortho-reference
 
+Note: the dataset is around 187 GB, so download may take some time.
+
 Download it using your preferred method (Hugging Face CLI, git-lfs, or the web UI), then pass the local reference-ortho directory to the evaluator.
 
 The evaluator looks for reference orthos using these patterns:
