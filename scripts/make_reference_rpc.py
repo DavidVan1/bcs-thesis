@@ -279,7 +279,7 @@ def main() -> None:
     parser.add_argument("--output", required=True, help="Root directory for the output data")
     parser.add_argument("--matcher", default="efficientloftr", help="Name of the feature matching algorithm to use")
     parser.add_argument("--stage", nargs="+", default=["calibrate", "rpc_fit"], help="Pipeline stages to execute")
-    parser.add_argument("--workers", type=int, default=12, help="Number of parallel worker processes")
+    parser.add_argument("--workers", type=int, default=1, help="Number of parallel worker processes")
     parser.add_argument("--scene", default=None, help="Optional: process a single scene by name or path")
     args = parser.parse_args()
 
@@ -311,7 +311,7 @@ def main() -> None:
         print(f"[INFO] Launching {max_workers} workers (on GPU(s)): {gpu_ids}")
     else:
         gpu_queue = None
-        max_workers = args.workers if args.workers > 12 else 24
+        max_workers = args.workers
 
 
     print(f"[INFO] Using {max_workers} workers based on VRAM constraints.")

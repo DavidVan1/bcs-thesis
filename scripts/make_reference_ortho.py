@@ -161,7 +161,7 @@ def main() -> None:
     parser.add_argument("--scene", default=None, help="Optional: process a single scene by name or path")
     parser.add_argument("--min-ncc", type=float, default=0.4, help="NCC correlation threshold for verification")
     parser.add_argument("--overwrite-ortho", action="store_true", help="Force re-generation of existing ortho TIFFs")
-    parser.add_argument("--workers", type=int, default=10, help="Number of concurrent worker processes")
+    parser.add_argument("--workers", type=int, default=1, help="Number of concurrent worker processes")
     
     args = parser.parse_args()
 
