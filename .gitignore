@@ -36,4 +36,12 @@ Thumbs.db
 .ipynb_checkpoints/
 *.ipynb
 !/data_preparation/classification.ipynb
-!/data_preparation/notebooks/*
+!/data_preparation/notebooks/
+
+# Notebook virtual environment and local install files
+/data_preparation/notebooks/bin/
+/data_preparation/notebooks/lib/
+/data_preparation/notebooks/lib64/
+/data_preparation/notebooks/include/
+/data_preparation/notebooks/share/
+/data_preparation/notebooks/pyvenv.cfg
