@@ -278,7 +278,7 @@ def main() -> None:
     parser.add_argument("--dataset", required=False, help="Directory containing the input scene folders")
     parser.add_argument("--output", required=True, help="Root directory for the output data")
     parser.add_argument("--matcher", default="efficientloftr", help="Name of the feature matching algorithm to use")
-    parser.add_argument("--stage", nargs="+", default=["calibrate", "rpc_fit"], help="Pipeline stages to execute")
+    parser.add_argument("--stage", nargs="+", default=["all"], help="Pipeline stages to execute")
     parser.add_argument("--workers", type=int, default=1, help="Number of parallel worker processes")
     parser.add_argument("--scene", default=None, help="Optional: process a single scene by name or path")
     args = parser.parse_args()

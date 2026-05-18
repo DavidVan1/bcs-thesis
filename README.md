@@ -35,6 +35,8 @@ The evaluator looks for reference orthos using these patterns:
 - `reference_dir/<scene_id>/ortho_reference_*.tif`
 - `reference_dir/*<scene_id>*ortho*.tif`
 
+If you want to create the reference dataset, see [scripts/README.md](scripts/README.md).
+
 ## Implement Your Algorithm
 
 Fill in `compute_rpc` in `make_rpc_template.py`:
