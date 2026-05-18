@@ -1,0 +1,2 @@
+InsulaWorkflowClient==0.8.8
+Requests==2.32.5

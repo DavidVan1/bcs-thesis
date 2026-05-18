@@ -1,0 +1,10 @@
+.idea
+CollectionBatchDownloadScript/downloaded/
+CollectionBatchDownloadScript/lists/
+
+notebooks/
+notebooks/bin/
+notebooks/lib/
+notebooks/include/
+notebooks/share/
+notebooks/pyvenv.cfg

@@ -1,0 +1,2 @@
+[console_scripts]
+insulaClient = insula.InsulaWorkflowClient:main
