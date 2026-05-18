@@ -6,9 +6,11 @@
 !environment_eval.yml
 !/evaluation/
 !/scripts/
+!/classification/
 !evaluate_external_rpc.py
 !make_rpc_template.py
-!dataset.csv
+!reference_dataset.csv
+
 
 *.md
 !README.md
@@ -33,3 +35,4 @@ Thumbs.db
 
 .ipynb_checkpoints/
 *.ipynb
+!/classification/classification.ipynb
