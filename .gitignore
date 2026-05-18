@@ -2,6 +2,9 @@
 !/.gitignore
 !/pipeline/
 !/third_party/
+/third_party/*
+!/third_party/LightGlue/
+!/third_party/EfficientLoFTR/
 !/environment.yml
 !environment_eval.yml
 !/evaluation/
