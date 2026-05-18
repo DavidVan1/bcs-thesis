@@ -1,0 +1,9 @@
+InsulaWorkflowClient
+openeo
+rasterio
+matplotlib
+geopandas
+mapclassify
+folium
+furl
+kfp

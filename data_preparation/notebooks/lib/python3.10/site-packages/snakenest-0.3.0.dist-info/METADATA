@@ -1,0 +1,176 @@
+Metadata-Version: 2.3
+Name: SnakeNest
+Version: 0.3.0
+Summary: Snake Nest
+Author-email: Roberto Di Rienzo <roberto.dirienzo@codelithic.com>
+Maintainer-email: Roberto Di Rienzo <roberto.dirienzo@codelithic.com>
+License-File: LICENSE.txt
+Keywords: codelithic,injection,spring
+Classifier: Development Status :: 4 - Beta
+Classifier: Programming Language :: Python
+Requires-Python: >=3.9
+Requires-Dist: pyyaml
+Description-Content-Type: text/markdown
+
+# SnakeNest
+
+nest.yaml
+
+```yaml
+application:
+  name: test
+  spesa:
+    - casa
+    - sale
+    - olio
+
+
+snake:
+  test:
+    enable: pollo
+```
+
+Example 1
+
+```python
+from snakenest import *
+from abc import ABC, abstractmethod
+
+
+class WorkflowManager(ABC):
+    @abstractmethod
+    def test(self):
+        pass
+
+
+@Snake(condition={'key': 'snake.test.enable', 'value': 'salame'})
+class Test1(WorkflowManager):
+
+    def __init__(self):
+        super().__init__()
+
+    def test(self):
+        print("Test1")
+
+
+@Snake(condition={'key': 'snake.test.enable', 'value': 'pollo'})
+class Test2(WorkflowManager):
+    def __init__(self):
+        super().__init__()
+
+    def test(self):
+        print("Test2")
+
+
+class Check:
+    @Poisoned()
+    def __init__(self, wf: WorkflowManager):
+        wf.test()
+
+
+def print_hi(name):
+    Check()
+
+
+if __name__ == '__main__':
+    Nest.initialize()
+    print_hi('Clint')
+
+
+```
+
+Example 2
+
+```python
+from snakenest import *
+
+
+@Snake(args={"val1": "10", "val2": "22"})
+class Config:
+    def __init__(self, val1, val2):
+        self.val1 = val1
+        self.val2 = val2
+
+    def get_val1(self):
+        return self.val1
+
+    def get_val2(self):
+        return self.val2
+
+
+@Snake()
+class MyCondition:
+    def __init__(self):
+        pass
+
+
+@Snake()
+class Test:
+    @Poisoned()
+    def __init__(self, config: Config):
+        self.__config = config
+        print(f'Test: {self.__config.__dict__}')
+
+    def hello(self, name):
+        return f"Test: Hello {name}"
+
+    def getName(self):
+        return "test_name"
+
+
+@Snake(name='testName', args={"q": "10", "b": "${application.spesa:casa}"})
+class Pollo:
+    def __init__(self, q, b):
+        self.q, self.b = q, b
+
+    def hello(self, name):
+        return f"Test_named: Hello {name}"
+
+    def getName(self):
+        return f'Pollo -> TestNamed: {self.q} - {self.b}'
+
+
+class Test2:
+
+    @Poisoned()
+    def __init__(self, config: Config):
+        self.__config = config
+        print(f'Test2: {self.__config.__dict__}')
+
+    @Poisoned()
+    def getTestName(self, panico, name: Test):
+        return name.hello(panico)
+
+    @Poisoned(name='testName')
+    def getTestName2(self, name):  # <-- tipo non definito ma injected
+        return name.getName()
+
+
+def print_hi(name):
+    t2 = Test2()
+    print(f'Hi, {name}, {t2.getTestName("sale")} {t2.getTestName2()} ')
+
+
+if __name__ == '__main__':
+    Nest.initialize()
+    print_hi('PyCharm')
+    # SnakeNest.clear()
+
+```
+
+SnakeBus message
+
+```python
+class MySubscriber(SnakeNotificationSubscriber):
+    def handle_event(self, event_type, data=None):
+        print(f'Received: {event_type} data: {data}')
+
+
+class Service:
+    def test(self):
+        SnakesBus.publish('eventTest', {'something': 'test_data'})
+
+
+SnakesBus.subscribe('eventTest', MySubscriber())
+Service().test()
+```
