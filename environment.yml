@@ -4,37 +4,58 @@ channels:
   - nvidia
   - conda-forge
   - defaults
+
 dependencies:
   - python=3.10
   - pip
-  - pytorch::pytorch>=2.0
-  - pytorch::torchvision>=0.15
-  - pytorch::pytorch-cuda=12.1
-  - conda-forge::numpy>=1.24
-  - conda-forge::scipy>=1.10
-  - conda-forge::pandas
-  - conda-forge::psutil
-  - conda-forge::opencv
-  - conda-forge::matplotlib>=3.7
-  - conda-forge::tqdm>=4.65
-  - conda-forge::scikit-learn>=1.3
-  - conda-forge::rasterio
-  - conda-forge::pyproj
-  - conda-forge::shapely
-  - conda-forge::libgdal-jp2openjpeg
-  - conda-forge::huggingface_hub
+
+  # PyTorch
+  - pytorch>=2.0
+  - torchvision>=0.15
+  - pytorch-cuda=12.1
+
+  - numpy>=1.24
+  - scipy>=1.10
+  - pandas
+  - scikit-learn>=1.3
+
+  # Vision / image
+  - opencv
+  - pillow>=10.0
+
+  # Geo stack
+  - rasterio
+  - pyproj
+  - shapely
+  - gdal
+  - libgdal-jp2openjpeg
+
+  # ML / deep learning utilities
+  - huggingface_hub
+  - einops
+
+  # Utilities
+  - psutil
+  - matplotlib>=3.7
+  - tqdm>=4.65
+  - loguru
+
   - pip:
     - "setuptools<82.0.0"
     - wheel
+    - pytorch-lightning
     - kornia>=0.7
-    - Pillow>=10.0
     - affine>=2.4
     - yacs
     - pycolmap
     - earthengine-api
     - geedim
 
-# Create:  conda env create -f environment.yml
-# Update:  conda env update -f environment.yml --prune
-# Activate: conda activate phisat
-# Run:     python -m pipeline.run sf
+# ── Commands ────────────────────────────────────────────────────────────────
+# Install libmamba solver first (one-time):
+#   conda install -n base conda-libmamba-solver
+#   conda config --set solver libmamba
+#
+# Create:   conda env create -f environment.yml
+# Update:   conda env update -f environment.yml --prune
+# Activate: conda activate phis
