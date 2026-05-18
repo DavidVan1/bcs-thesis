@@ -6,6 +6,8 @@ Download the dataset from Hugging Face:
 https://huggingface.co/datasets/davidvan1/phisat2-ortho-reference
 It contains the input files, reference files, and other data needed for the scripts.
 
+If you want to see how the input data was downloaded, see [data_preparation/README.md](../data_preparation/README.md).
+
 In `input/scenes`, you will find the input data for each scene: PhiSat-2 imagery, DEM, Sentinel imagery, and Sentinel GRI GCP data.
 
 Available matchers are `efficientloftr` and `lightglue`.
